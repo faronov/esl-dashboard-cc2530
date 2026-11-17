@@ -1,0 +1,22 @@
+{
+  "schema": "cc2530-app/1",
+  "name": "esl-dashboard",
+  "description": "L8 dashboard on a Waveshare 4.26\" SSD1677 e-paper driven by the LG ESL29 CC2530 board: LEAN PM2 sleepy end device, Home Assistant writes cluster 0xFC10",
+  "defines": [
+    "-DCC2530_PARENT_RECOVERY",
+    "-DCC2530_ROUTER_JOIN",
+    "-DCC2530_AUTONOMOUS",
+    "-DCC2530_LEAN",
+    "-DCC2530_RX_OFF_IDLE",
+    "-DCC2530_PM2_IDLE",
+    "-DCC2530_CHIP_SENSE",
+    "-DCC2530_REPLAY_POLICY_C",
+    "-DCC2530_ZDO_DESCRIPTORS",
+    "-DCC2530_APP_QUIET"
+  ],
+  "include": ["include"],
+  "units": {
+    "zcl_sensor": "src/zcl_dashboard.c",
+    "lg_esl29_rev03": "boards/lg_esl29.c"
+  }
+}
