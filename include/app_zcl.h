@@ -5,7 +5,7 @@
 #define APP_ZCL_H
 /* Included by the stack's zcl_sensor.h for CC2530_APP: the L8 dashboard
  * server (src/zcl_dashboard.c). One endpoint: Basic, Power Configuration,
- * Identify, Temperature (CC2530 die sensor), Relative Humidity (synthetic)
+ * Identify, Temperature and Relative Humidity (SHT3x, sht3x.h)
  * and the display cluster 0xFC10 (display.h) that Home Assistant writes.
  * RAM only: a reset restores the defaults and blanks the dashboard texts. */
 
@@ -29,15 +29,10 @@ typedef struct {
     /* Receive scratch. */
     uint16_t id, min, max, delta;
     uint8_t length, header, at, in, entry, type, kind, dir, status, apply;
-    /* Last die temperature (0.01 C, INVALID on failure), AVDD (mV, 0 on
-     * failure) and READY seconds since that measurement. */
-    int16_t temperature;
+    /* Last AVDD (mV, 0 on failure) and READY seconds since that
+     * measurement (also the SHT3x's, sht3x.h). */
     uint16_t millivolts;
     uint8_t measured;
-    /* Last raw sensor sum (negative on failure) and the factory word used
-     * (always 0xFFFF), for calibration diagnostics. */
-    int16_t sum;
-    uint16_t factory;
 } zcl_sensor_state_t;
 
 /* In READY the device's association record is dead (see bdb_join.h) and

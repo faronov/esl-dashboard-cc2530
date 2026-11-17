@@ -190,6 +190,8 @@ static void load(size_t i, epd_view_t *view)
         mac_attempt_raw.frame.length = 10;
         mac_attempt_raw.frame.rssi_raw = (uint8_t)(l8_golden[i].rssi + 73);
     }
+    epd_l8.linked = l8_golden[i].lqi >= 0;
+    epd_l8.lqi = (uint8_t)l8_golden[i].lqi;
     memset(view, 0xa5, sizeof(*view));
     epd_format(view, l8_golden[i].t_in, l8_golden[i].h_in, l8_golden[i].mv);
 }

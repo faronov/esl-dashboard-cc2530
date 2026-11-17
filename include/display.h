@@ -38,8 +38,6 @@
 #define EPD_PARTIALS 12u
 /* An unchanged view is compared again after CHECK. */
 #define EPD_CHECK EPD_SECONDS(10)
-/* No indoor humidity sensor: L8 shows --. */
-#define EPD_PLACEHOLDER_HUMIDITY 0xffffu
 
 enum {
     EPD_IDLE = 0, EPD_RESET, EPD_BOOT, EPD_POWER, EPD_OLD, EPD_NEW, EPD_LOAD, EPD_REFRESH, EPD_OFF
@@ -53,7 +51,8 @@ enum {
  * 0.01 %RH (0xFFFF unknown), weather 0..9; the slot labels and values and
  * the message are glyph codes padded with EPD_L8_END. dirty: a write
  * changed what is shown; written: the last write; started: the last
- * refresh start; heard/rssi: the last received frame's raw RSSI. */
+ * refresh start; heard/rssi: the last received frame's raw RSSI; linked/lqi:
+ * the parent's LQI of this device from its last Mgmt_Lqi_rsp. */
 #define EPD_L8_END 0xffu
 #define EPD_L8_CLUSTER 0xfc10u
 #define EPD_L8_SLOTS 4u
@@ -63,12 +62,13 @@ enum {
 /* L8 (tools/epd/l8_art.py, docs/DISPLAY.md): everything the panel shows,
  * as glyph codes (ASCII 20..7E as 0..94, U+0410..U+044F as 95..158, Ё 159,
  * ё 160, ° 161) ending at or padded with EPD_L8_END: battery gauge fill
- * (0..36 columns), weather icon (0 none, 1..9), voltage, RSSI, clock, the
+ * (0..36 columns), weather icon (0 none, 1..9), voltage, RSSI and parent
+ * LQI, clock, the
  * indoor and outdoor temperature and humidity, and copies of the epd_l8
  * slot texts and message, so a view shown last can be drawn again. */
 typedef struct {
     uint8_t fill, weather;
-    uint8_t volt[7], rssi[10], clock[15];
+    uint8_t volt[7], rssi[18], clock[15];
     uint8_t indoor[7], humidity[4], outdoor[7], outdoor_humidity[4];
     uint8_t label[EPD_L8_SLOTS][EPD_L8_LABEL], value[EPD_L8_SLOTS][EPD_L8_VALUE];
     uint8_t message[EPD_L8_MESSAGE];
@@ -82,7 +82,7 @@ typedef struct {
     uint32_t time, tick, written, started;
     uint16_t interval, outdoor_humidity;
     int16_t outdoor;
-    uint8_t weather, dirty, ready, heard, rssi;
+    uint8_t weather, dirty, ready, heard, rssi, linked, lqi;
     uint8_t label[EPD_L8_SLOTS][EPD_L8_LABEL], value[EPD_L8_SLOTS][EPD_L8_VALUE];
     uint8_t message[EPD_L8_MESSAGE];
 } epd_l8_t;

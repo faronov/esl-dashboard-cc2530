@@ -34,9 +34,11 @@ Assistant dashboard. Pins, the command sequence and the timing are in
 rendered row by row (100 octets per row, no frame buffer).
 
 - status bar: battery gauge (0..36 columns for 2.0 .. 3.0 V) and voltage,
-  Zigbee icon and the RSSI of the last received frame, local clock
+  Zigbee icon, the RSSI of the last received frame and the parent's LQI
+  of this device (`LQI --` until known), local clock
   (`Пн 21.04 14:32`, `-- --.-- --:--` until a time is written);
-- left half `ДОМА`: the device's temperature and humidity (7-segment);
+- left half `ДОМА`: the device's temperature and humidity from the SHT3x
+  (7-segment, `--` without a sensor);
 - right half `УЛИЦА`: outdoor temperature and humidity and a 96×96 weather
   icon (a Material Design Icons weather icon, 48×48 drawn twice the size),
   all pushed by Home Assistant;

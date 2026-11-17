@@ -6,7 +6,7 @@ PYTHON ?= python3
 LLVM_TOOLS ?= ../llvm-mcs51-build/bin
 LLVM_SRC ?= ../llvm-project
 FIRMWARE_OUT ?= build/firmware
-HOST_DEFINES := -DCC2530_CHIP_SENSE -DCC2530_ZDO_DESCRIPTORS -DCC2530_APP_QUIET
+HOST_DEFINES := -DCC2530_CHIP_SENSE -DCC2530_ZDO_DESCRIPTORS -DCC2530_APP_QUIET -DCC2530_APP_MGMT_LQI
 TESTS := test_display test_zcl_dashboard
 # Linked with test_zcl_dashboard; the stack's temperature codec cross-checks
 # the server's reads.

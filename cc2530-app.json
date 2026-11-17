@@ -12,7 +12,8 @@
     "-DCC2530_CHIP_SENSE",
     "-DCC2530_REPLAY_POLICY_C",
     "-DCC2530_ZDO_DESCRIPTORS",
-    "-DCC2530_APP_QUIET"
+    "-DCC2530_APP_QUIET",
+    "-DCC2530_APP_MGMT_LQI"
   ],
   "include": ["include"],
   "units": {

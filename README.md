@@ -6,8 +6,9 @@ dashboard. It is a LEAN, PM2 sleepy Zigbee 3.0 end device built on the
 [cc2530-zigbee](https://github.com/faronov/cc2530-zigbee) stack with the
 LLVM MCS-51 compiler, and it does not use Z-Stack.
 
-The panel shows the battery, the link RSSI and a local clock, the indoor
-temperature, the outdoor weather pushed by Home Assistant, four labelled
+The panel shows the battery, the link RSSI and the parent's LQI, a local
+clock, the indoor temperature and humidity from an SHT30/SHT31 sensor, the
+outdoor weather pushed by Home Assistant, four labelled
 value slots and a message line. Home Assistant writes them through the
 manufacturer-specific cluster 0xFC10 on endpoint 1; see
 [docs/DISPLAY.md](docs/DISPLAY.md).
@@ -23,6 +24,16 @@ ZHA quirk and the Zigbee2MQTT converter in [`tools/ha/`](tools/ha) apply.
   failure; not yet verified on hardware.
 - Not yet qualified: sleep current.
 
+## SHT3x sensor
+
+Temperature Measurement 0x0402 and Relative Humidity 0x0405 come from an
+SHT30/SHT31 (address 0x44, ADDR low) on the board's TX/RX pads: TX is P1.6
+SDA, RX is P1.7 SCL. The stock firmware maps USART1 there (alternative 2);
+the pads have not been continuity tested. The bus needs pull-ups: a breakout
+board's 4.7–10 kΩ to 3 V, or the weak internal port 1 pull-ups. The sensor is
+read every 10 s, each value one period late; without a sensor both read
+invalid and the panel shows `--`. The CC2530 die temperature is not used.
+
 ## Layout
 
 | Path | Contents |
@@ -31,6 +42,7 @@ ZHA quirk and the Zigbee2MQTT converter in [`tools/ha/`](tools/ha) apply.
 | `cc2530-app.json` | [external application](https://github.com/faronov/cc2530-zigbee/blob/main/docs/EXTERNAL_APP.md) manifest: stack options and replaced units |
 | `include/app_config.h` | board identity |
 | `include/app_zcl.h`, `src/zcl_dashboard.c` | ZCL application server, simple descriptor |
+| `include/sht3x.h`, `src/sht3x.c` | SHT3x temperature and humidity on bit-banged I2C |
 | `include/display.h`, `src/display.c` | SSD1677 driver and refresh state machine |
 | `src/dashboard.c`, `include/display_art.h` | dashboard renderer, cluster 0xFC10, generated glyphs and icons |
 | `boards/lg_esl29.c` | early pin parking, panel power |

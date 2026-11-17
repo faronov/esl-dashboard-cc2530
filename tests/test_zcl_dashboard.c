@@ -7,6 +7,7 @@
 #include "zcl_sensor.h"
 #include "zcl_temperature.h"
 #include "display.h"
+#include "sht3x.h"
 #include "radio_autoack.h"
 
 /* The L8 dashboard ZCL/Bind server (src/zcl_dashboard.c) against its real
@@ -26,52 +27,135 @@ static const uint8_t tc[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
 static const char model[] = BOARD_MODEL, manufacturer[] = BOARD_MANUFACTURER;
 static unsigned long checks;
 
-/* ADC model (SWRS081B nominals): AVDD5/3 against 1.15 V and the die sensor,
- * 1480 at 25 C and 3 V, 4.5 /C, 1 /0.1 V, live only with TR0=1, ATEST=1. */
+/* ADC model (SWRS081B nominals): AVDD5/3 against 1.15 V. */
 volatile uint8_t SOC_ADCCON1, SOC_ADCCON3, SOC_ADCL, SOC_ADCH;
 static struct {
-    long millivolts, centi;
-    uint8_t tr0, atest, stuck, fresh;
-    unsigned conversions, vdd, temperature, unsensed, overlapped, foreign;
+    long millivolts;
+    uint8_t stuck, fresh;
+    unsigned conversions, overlapped, foreign;
 } adc;
-/* Per-chip sensor bias (counts at 25 C, 3 V) and the information-page word
- * at ZCL_SENSOR_FACTORY (big endian); reads counts loads of that word. */
-static struct {
-    long bias;
-    uint16_t word;
-    unsigned reads;
-} chip_page = { 0, 0xffffu, 0 };
 
 static void convert_model(uint8_t command)
 {
-    long code;
+    long code = 0;
     if ((SOC_ADCCON1 & 0x80u) || adc.fresh) adc.overlapped++;
     adc.conversions++;
-    if (command == 0x3fu) {
-        adc.vdd++;
-        code = (adc.millivolts*2048 + 1725) / 3450;
-    } else if (command == 0x3eu) {
-        adc.temperature++;
-        if (adc.tr0 != 1u || adc.atest != 1u) { adc.unsensed++; code = 0; }
-        else code = 1480 + chip_page.bias + (adc.centi-2500)*45/1000 + (adc.millivolts-3000)/100;
-        /* Tests use whole-count temperatures: 25 C plus multiples of 2 C. */
-        CHECK((adc.centi-2500) % 200 == 0 && (adc.millivolts-3000) % 100 == 0);
-    } else {
-        adc.foreign++;
-        code = 0;
-    }
+    if (command == 0x3fu) code = (adc.millivolts*2048 + 1725) / 3450;
+    else adc.foreign++;
     if (code > 2047) code = 2047;
     code = (long)((uint16_t)(code << 4));
     SOC_ADCL = (uint8_t)code; SOC_ADCH = (uint8_t)(code >> 8);
     adc.fresh = 1;
-    if (adc.stuck != 1u && (adc.stuck != 2u || command != 0x3eu)) SOC_ADCCON1 |= 0x80u;
+    if (!adc.stuck) SOC_ADCCON1 |= 0x80u;
 }
 
+/* Bit-level SHT3x-DIS slave on the sht3x.h port 1 lines (open drain: a line
+ * is low if the master drives it, P1DIR set with latch 0, or the slave pulls
+ * SDA). Single shot 0x2400 measures at once; the next busy read headers are
+ * NACKed, then the result is read once. */
+volatile uint8_t SOC_P1, SOC_P1DIR, SOC_P1SEL;
+#define SDA SHT3X_SDA
+#define SCL SHT3X_SCL
+enum { BUS_IDLE, BUS_RX, BUS_ACK, BUS_TX, BUS_MASTER_ACK };
+static struct {
+    uint8_t present, stuck, corrupt, ready;
+    uint16_t busy, wait, t, h, command;
+    uint8_t out[6], index, mode, bits, byte, first, reading, ncommand, pull, sda, scl, acked;
+    unsigned starts, stops, measures, results, nacked, unknown, reads, latch;
+} sht;
+
+static uint8_t sht_crc(uint16_t word)
+{
+    uint8_t c = 0xffu, i, b;
+    for (b = 0; b < 2; b++) {
+        c ^= (uint8_t)(b ? word : word >> 8);
+        for (i = 0; i < 8; i++) c = c & 0x80u ? (uint8_t)(c << 1 ^ 0x31u) : (uint8_t)(c << 1);
+    }
+    return c;
+}
+
+static uint8_t level(uint8_t mask)
+{
+    if ((SOC_P1DIR & mask) && !(SOC_P1 & mask)) return 0;
+    if (mask == SCL) return !sht.stuck;
+    return !sht.pull;
+}
+
+static void sht_received(void)
+{
+    uint8_t ack = 0, b = sht.byte;
+    if (sht.first) {
+        sht.first = 0;
+        if (sht.present && (b >> 1) == SHT3X_ADDRESS) {
+            if (!(b & 1u)) { ack = 1; sht.reading = 0; sht.ncommand = 0; sht.command = 0; }
+            else if (sht.ready && !sht.wait) { ack = 1; sht.reading = 1; sht.index = 0; sht.ready = 0; sht.reads++; }
+            else { if (sht.wait) sht.wait--; sht.nacked++; }
+        }
+    } else if (sht.ncommand < 2u) {
+        ack = 1;
+        sht.command = (uint16_t)(sht.command << 8 | b);
+        if (++sht.ncommand == 2u) {
+            if (sht.command == 0x2400u) {
+                sht.out[0] = (uint8_t)(sht.t >> 8); sht.out[1] = (uint8_t)sht.t; sht.out[2] = sht_crc(sht.t);
+                sht.out[3] = (uint8_t)(sht.h >> 8); sht.out[4] = (uint8_t)sht.h; sht.out[5] = sht_crc(sht.h);
+                if (sht.corrupt) { sht.out[5] ^= 1u; sht.corrupt--; }
+                sht.ready = 1; sht.wait = sht.busy; sht.measures++;
+            } else sht.unknown++;
+        }
+    } else sht.unknown++;
+    sht.pull = ack;
+    sht.mode = ack ? BUS_ACK : BUS_IDLE;
+}
+
+static void sht_transmit(void)
+{
+    sht.byte = sht.out[sht.index++]; sht.bits = 0;
+    sht.pull = !(sht.byte & 0x80u);
+    sht.mode = BUS_TX;
+}
+
+static void sht_bus(void)
+{
+    uint8_t sda = level(SDA), scl = level(SCL);
+    if (scl && sht.scl && sda != sht.sda) {
+        if (!sda) { sht.starts++; sht.mode = BUS_RX; sht.bits = 0; sht.byte = 0; sht.first = 1; }
+        else { sht.stops++; sht.mode = BUS_IDLE; }
+        sht.pull = 0;
+    } else if (scl && !sht.scl) {
+        if (sht.mode == BUS_RX && sht.bits < 8u) { sht.byte = (uint8_t)(sht.byte << 1 | sda); sht.bits++; }
+        else if (sht.mode == BUS_MASTER_ACK) sht.acked = !sda;
+    } else if (!scl && sht.scl) {
+        if (sht.mode == BUS_RX && sht.bits == 8u) sht_received();
+        else if (sht.mode == BUS_ACK) {
+            sht.pull = 0;
+            if (sht.reading) sht_transmit();
+            else { sht.mode = BUS_RX; sht.bits = 0; sht.byte = 0; }
+        } else if (sht.mode == BUS_TX) {
+            if (++sht.bits == 8u) { sht.pull = 0; sht.mode = BUS_MASTER_ACK; }
+            else sht.pull = !((uint8_t)(sht.byte << sht.bits) & 0x80u);
+        } else if (sht.mode == BUS_MASTER_ACK) {
+            if (sht.index == 6u) sht.results++;
+            if (sht.acked && sht.index < 6u) sht_transmit();
+            else { sht.mode = BUS_IDLE; sht.pull = 0; }
+        }
+    }
+    sht.sda = level(SDA); sht.scl = level(SCL);
+}
+
+static void sht_set(double centi, double humidity, uint8_t present)
+{
+    memset(&sht, 0, sizeof(sht));
+    sht.present = present;
+    sht.t = (uint16_t)((centi/100.0 + 45.0) / 175.0 * 65535.0 + 0.5);
+    sht.h = (uint16_t)(humidity/100.0 / 100.0 * 65535.0 + 0.5);
+    sht.sda = sht.scl = 1;
+}
 
 uint8_t host_mmio_load(const volatile uint8_t *reg, uint8_t address)
 {
     uint8_t v = *reg;
     if (address == SOC_ADCH_ADDRESS) { SOC_ADCCON1 &= 0x7fu; adc.fresh = 0; }
+    if (address == SOC_P1_ADDRESS) v = (uint8_t)((v & (uint8_t)~(SDA | SCL)) | (level(SDA) ? SDA : 0) | (level(SCL) ? SCL : 0));
     return v;
 }
 
@@ -79,25 +163,26 @@ void host_mmio_store(volatile uint8_t *reg, uint8_t address, uint8_t value)
 {
     *reg = value;
     if (address == SOC_ADCCON3_ADDRESS) convert_model(value);
+    if (address == SOC_P1_ADDRESS && (value & (SDA | SCL))) sht.latch++;
+    if (address == SOC_P1DIR_ADDRESS || address == SOC_P1_ADDRESS) sht_bus();
 }
 
+/* The die sensor (TR0, ATEST) is not used. */
 uint8_t host_mmio_xload(uint16_t address)
 {
-    CHECK(address == 0x61bdu);
-    return adc.atest;
+    CHECK(!address && 0);
+    return 0;
 }
 
 void host_mmio_xstore(uint16_t address, uint8_t value)
 {
-    CHECK(address == 0x61bdu || address == 0x624bu);
-    if (address == 0x61bdu) adc.atest = value; else adc.tr0 = value;
+    CHECK(!address && !value && 0);
 }
 
-static void adc_set(long millivolts, long centi, uint8_t stuck)
+static void adc_set(long millivolts, uint8_t stuck)
 {
-    uint8_t atest = adc.atest;
     memset(&adc, 0, sizeof(adc));
-    adc.millivolts = millivolts; adc.centi = centi; adc.stuck = stuck; adc.atest = atest;
+    adc.millivolts = millivolts; adc.stuck = stuck;
     SOC_ADCCON1 = 0x30u;
 }
 
@@ -196,7 +281,7 @@ static void standalone_read(const uint8_t *request, uint8_t length)
     zcl_temp_cfg_t defaults = {30, 300, 10};
     zcl_dispatch_info_t info;
     uint8_t output[ED_PAYLOAD_MAX];
-    CHECK(zcl_temp_init(&temperature, 0, 2100, 2500, &defaults) == ZCL_CODEC_OK);
+    CHECK(zcl_temp_init(&temperature, 0, -4000, 12500, &defaults) == ZCL_CODEC_OK);
     temperature.reporting.minimum = ST.report[0].min;
     temperature.reporting.maximum = ST.report[0].max;
     temperature.reporting.change = (int16_t)ST.report[0].change;
@@ -371,42 +456,24 @@ static void idle(void)
 
 static void values(void)
 {
-    uint8_t s;
-    CHECK(ZCL_SENSOR_SAMPLE(0) == 0 && ZCL_SENSOR_SAMPLE((1ul << 22)-1) == 0);
-    CHECK(ZCL_SENSOR_SAMPLE(1ul << 22) == 1 && ZCL_SENSOR_SAMPLE(0x3ffffffful) == 255);
-    CHECK(ZCL_SENSOR_SAMPLE(0x40000000ul) == 0 && ZCL_SENSOR_SAMPLE(0xfffffffful) == 255);
-    for (s = 0; s < 255; s++) {
-        uint8_t p = ZCL_SENSOR_PHASE(s);
-        CHECK(p == s % 41);
-        CHECK(ZCL_SENSOR_TEMPERATURE(p) == 2100 + 10*p && ZCL_SENSOR_HUMIDITY(p) == 4500 + 25*p);
-        CHECK(ZCL_SENSOR_PERCENTAGE(p) == 200 - p && ZCL_SENSOR_VOLTAGE(p) == 30 - p/14);
-    }
-    CHECK(ZCL_SENSOR_TEMPERATURE(40) == 2500 && ZCL_SENSOR_HUMIDITY(40) == 5500);
-    CHECK(ZCL_SENSOR_PERCENTAGE(40) == 160 && ZCL_SENSOR_VOLTAGE(40) == 28);
+    long long u;
     /* Chip sense conversions: 1781 per sample is 3.0 V on AVDD5/3. */
     CHECK(ZCL_SENSOR_MILLIVOLTS(0) == 0 && ZCL_SENSOR_MILLIVOLTS(4*1781) == 3000);
     CHECK(ZCL_SENSOR_MILLIVOLTS(4*2047) == 3448 && ZCL_SENSOR_MILLIVOLTS(4*1187) == 2000);
-    CHECK(ZCL_SENSOR_COUNTS(11840, 3000, 0xffffu) == 0 && ZCL_SENSOR_COUNTS(11848, 3100, 0xffffu) == 0);
-    CHECK(ZCL_SENSOR_COUNTS(11840, 2000, 0xffffu) == 80);
-    CHECK(ZCL_SENSOR_CENTI(11840, 3000, 0xffffu) == 2500 + BOARD_CHIP_TEMPERATURE_OFFSET);
-    CHECK(ZCL_SENSOR_CENTI(11840+36*10, 3000, 0xffffu) == 3500 + BOARD_CHIP_TEMPERATURE_OFFSET);
-    /* 711/256 approximates 25/9 within 0.02 %. */
-    CHECK(abs(ZCL_SENSOR_CENTI(11840-36*35, 3000, 0xffffu) - (-1000 + BOARD_CHIP_TEMPERATURE_OFFSET)) <= 1);
-    CHECK(abs(ZCL_SENSOR_CENTI(11840+36*60, 3000, 0xffffu) - (8500 + BOARD_CHIP_TEMPERATURE_OFFSET)) <= 2);
-    /* Factory word: 12 bits 1380..1580 replace the 1480 nominal, keeping the
-     * two extra bits (word>>1 per 8 samples); others are ignored. */
-    CHECK(!ZCL_SENSOR_FACTORY_VALID(0xffffu) && !ZCL_SENSOR_FACTORY_VALID(0) && !ZCL_SENSOR_FACTORY_VALID(0x563cu));
-    CHECK(ZCL_SENSOR_FACTORY_VALID(0x5640u) && ZCL_SENSOR_FACTORY_VALID(0x62ccu) && !ZCL_SENSOR_FACTORY_VALID(0x62d0u));
-    CHECK(ZCL_SENSOR_REFERENCE(0xffffu) == 11840 && ZCL_SENSOR_REFERENCE(0x5a08u) == 11524);
-    CHECK(ZCL_SENSOR_BASE(0xffffu) == 2500 && ZCL_SENSOR_BASE(0x5a08u) == ZCL_SENSOR_FACTORY_CENTI);
-    CHECK(ZCL_SENSOR_CENTI(11524, 3000, 0x5a08u) == ZCL_SENSOR_FACTORY_CENTI + BOARD_CHIP_TEMPERATURE_OFFSET);
-    CHECK(ZCL_SENSOR_CENTI(11524+36*10, 3000, 0x5a08u) == ZCL_SENSOR_FACTORY_CENTI + 1000 + BOARD_CHIP_TEMPERATURE_OFFSET);
-    CHECK(ZCL_SENSOR_COUNTS(11532, 3100, 0x5a08u) == 0 && ZCL_SENSOR_COUNTS(11522, 3000, 0x5a80u) == -62);
     CHECK(ZCL_SENSOR_DECIVOLTS(0) == 0xff && ZCL_SENSOR_DECIVOLTS(2949) == 29 && ZCL_SENSOR_DECIVOLTS(2950) == 30);
     CHECK(ZCL_SENSOR_HALF_PERCENT(0) == 0xff && ZCL_SENSOR_HALF_PERCENT(1) == 0);
     CHECK(ZCL_SENSOR_HALF_PERCENT(BOARD_BATTERY_EMPTY_MV) == 0);
     CHECK(ZCL_SENSOR_HALF_PERCENT(BOARD_BATTERY_FULL_MV) == 200 && ZCL_SENSOR_HALF_PERCENT(3600) == 200);
     CHECK(ZCL_SENSOR_HALF_PERCENT((BOARD_BATTERY_EMPTY_MV+BOARD_BATTERY_FULL_MV)/2) == 100);
+    /* SHT3x model and macros against the datasheet CRC example and the exact
+     * formulas. */
+    CHECK(sht_crc(0xbeefu) == 0x92u);
+    for (u = 0; u <= 0xffff; u++) {
+        CHECK(llabs(SHT3X_CENTI(u)*65535ll - (17500*u - 4500ll*65535)) < 65535);
+        CHECK(llabs(SHT3X_HUMIDITY(u)*65535ll - 10000*u) < 65535);
+    }
+    CHECK(SHT3X_CENTI(0) == -4500 && SHT3X_CENTI(0xffffu) == 13000);
+    CHECK(SHT3X_HUMIDITY(0) == 0 && SHT3X_HUMIDITY(0xffffu) == 10000);
 }
 
 
@@ -568,251 +635,284 @@ static void bind(void)
 
 /* Synthetic sawtooth schedule; chip() covers measured reports. */
 
-static uint8_t binding_golden(uint8_t *output, uint8_t sequence, uint8_t start, uint8_t capacity)
-{
-    static const uint16_t clusters[] = {0x0402, 0x0405, 0x0001};
-    uint8_t i, total = 0, index = 0, at = 5;
-    for (i = 0; i < 3; i++) if (ST.bound[i]) total++;
-    memcpy(output, "\x91\x00\x00\x00\x00", 5);
-    output[0] = sequence; output[2] = total; output[3] = total ? start : 0;
-    for (i = 0; i < 3; i++) {
-        if (!ST.bound[i]) continue;
-        if (index++ < start) continue;
-        if (capacity-at < 21) break;
-        memcpy(output+at, own, 8); output[at+8] = 1;
-        output[at+9] = (uint8_t)clusters[i]; output[at+10] = (uint8_t)(clusters[i] >> 8);
-        output[at+11] = 3; memcpy(output+at+12, tc, 8); output[at+20] = ST.bound[i];
-        output[4]++; at += 21;
-    }
-    return at;
-}
-
-static void management_query(uint8_t start, uint8_t sequence, uint8_t length)
-{
-    uint8_t request[ED_PAYLOAD_MAX], expected[ED_PAYLOAD_MAX], size;
-    zcl_sensor_state_t before = ST;
-    bdb_join_config_t config = join_smoke_device.config;
-    nwk_parent_choice_t parent = join_smoke_device.parent;
-    memset(request, 0x5a, sizeof(request)); request[0] = sequence; request[1] = start;
-    size = binding_golden(expected, sequence, start, ED_PAYLOAD_MAX);
-    memset(&CTX.application, 0, sizeof(CTX.application));
-    CTX.application.nwk.source = 0x1234; CTX.application.nwk.destination = 0x4321;
-    CTX.application.aps.cluster_id = 0x0033;
-    CTX.application.aps.flags = APS_FLAG_ACK_REQUEST;
-    memcpy(CTX.application.payload, request, length); CTX.application.length = length;
-    CTX.application_ready = 1;
-    CHECK(zcl_sensor_serve() == ZCL_SENSOR_HANDLED);
-    CHECK(CTX.response_pending && CTX.response.length == size);
-    CHECK(!memcmp(CTX.response.payload, expected, size));
-    CHECK(CTX.response.aps.cluster_id == 0x8033 && !CTX.response.aps.profile_id &&
-          !CTX.response.aps.source_endpoint && !CTX.response.aps.destination_endpoint);
-    CHECK(CTX.response.nwk.destination == 0x1234 && CTX.response.nwk.version == 2 &&
-          CTX.response.nwk.radius == 30 && CTX.response.nwk.discover_route == NWK_DISCOVER_ROUTE_ENABLE);
-    CHECK(!memcmp(ST.bound, before.bound, sizeof(ST.bound)));
-    CHECK(!memcmp(ST.report, before.report, sizeof(ST.report)));
-    CHECK(!memcmp(ST.tc_ieee, before.tc_ieee, 8));
-    CHECK(ST.second == before.second && ST.identify == before.identify && ST.value == before.value &&
-          ST.basic == before.basic && ST.pending == before.pending && ST.sent == before.sent && ST.tsn == before.tsn);
-    CHECK(!memcmp(&join_smoke_device.config, &config, sizeof(config)) &&
-          !memcmp(&join_smoke_device.parent, &parent, sizeof(parent)));
-    CTX.application_ready = CTX.response_pending = 0;
-}
-
+/* Mgmt_Bind_req is NOT_SUPPORTED; a short request or a busy slot drops it.
+ * Init rejects an unknown identity without touching the state. */
 static void management_bind(void)
 {
-    static const uint16_t clusters[] = {0x0402, 0x0405, 0x0001};
-    uint8_t request[22], output[ED_PAYLOAD_MAX+2], expected[ED_PAYLOAD_MAX];
-    uint8_t mask, i, start, capacity, size, length;
     zcl_sensor_state_t before;
     ed_packet_t occupied;
     security_keys_config_t identity;
-    uint16_t initial;
     reset(0);
-    initial = ST.report[0].last;
-    CHECK(zdo(0x0033, "\x91\x00", 2) == ZCL_SENSOR_HANDLED);
-    CHECK(CTX.response_pending && CTX.response.length == 68);
-    CHECK(!memcmp(CTX.response.payload, "\x91\x00\x03\x00\x03", 5));
-    CHECK(!memcmp(CTX.response.payload+5, own, 8));
-    CHECK(!memcmp(CTX.response.payload+17, tc, 8));
-    CTX.response_pending = 0;
-    /* A read is not a report completion or an application timer poll. */
-    ST.sent = 1; ST.pending = 0; ST.value = 2340; ST.report[0].age = 17;
-    CTX.last += 3*ZCL_SENSOR_SECOND;
-    management_query(0, 0x92, 2);
-    CHECK(ST.sent == 1 && ST.report[0].age == 17 && ST.report[0].last == initial);
-    reset(0);
-    for (mask = 0; mask < 8; mask++) {
-        reset(0);
-        for (i = 0; i < 3; i++) if (!(mask & (1u << i))) {
-            request[0] = 0x92; memcpy(request+1, own, 8); request[9] = 1;
-            request[10] = (uint8_t)clusters[i]; request[11] = (uint8_t)(clusters[i] >> 8);
-            request[12] = 3; memcpy(request+13, tc, 8); request[21] = 1;
-            CHECK(zdo(0x0022, request, 22) == ZCL_SENSOR_HANDLED);
-            reply(0x8022, "\x92\x00", 2);
-        }
-        for (start = 0; start < 5; start++) management_query(start, (uint8_t)(0x93+start), 2);
-        management_query(255, 0x99, ED_PAYLOAD_MAX);
-        for (capacity = 0; capacity <= ED_PAYLOAD_MAX; capacity++) {
-            memset(output, 0xa5, sizeof(output)); before = ST;
-            size = zcl_sensor_binding_page(0x9a, 0, output+1, capacity);
-            CHECK(!memcmp(&ST, &before, sizeof(ST)));
-            CHECK(output[0] == 0xa5 && output[ED_PAYLOAD_MAX+1] == 0xa5);
-            if (capacity < 5) {
-                CHECK(!size);
-                for (i = 1; i <= ED_PAYLOAD_MAX; i++) CHECK(output[i] == 0xa5);
-            } else {
-                length = binding_golden(expected, 0x9a, 0, capacity);
-                CHECK(size == length && !memcmp(output+1, expected, size));
-                for (i = (uint8_t)(size+1); i <= ED_PAYLOAD_MAX; i++) CHECK(output[i] == 0xa5);
-            }
-        }
-    }
-    /* Actual Bind/Unbind owners, including repeated transactions. */
-    reset(0);
-    request[0] = 0xa0; memcpy(request+1, own, 8); request[9] = 1;
-    request[10] = 2; request[11] = 4; request[12] = 3; memcpy(request+13, tc, 8); request[21] = 1;
-    CHECK(zdo(0x0022, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8022, "\xa0\x00", 2);
-    CHECK(zdo(0x0022, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8022, "\xa0\x88", 2);
-    management_query(0, 0xa1, 2);
-    request[21] = 9;
-    CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\xa0\x00", 2);
-    CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\xa0\x00", 2);
-    management_query(0, 0xa2, 2);
     before = ST;
-    for (i = 0; i < 5; i++) {
-        uint8_t bad[22];
-        memcpy(bad, request, sizeof(bad));
-        if (!i) bad[10] = 6;
-        if (i == 1) bad[1] ^= 1;
-        if (i == 2) bad[9] = 2;
-        if (i == 3) bad[13] ^= 1;
-        if (i == 4) bad[12] = 2;
-        CHECK(zdo(0x0021, bad, 22) == ZCL_SENSOR_HANDLED);
-        CHECK(CTX.response_pending && CTX.response.payload[1]);
-        CHECK(!memcmp(ST.bound, before.bound, sizeof(ST.bound)));
-        CTX.response_pending = 0;
-        management_query(0, 0xa3, 2);
-    }
-    for (i = 0; i < 20; i++) management_query(1, (uint8_t)(0xb0+i), 2);
-    /* Busy queue and inadmissible contexts never alter live state. */
-    for (i = 0; i < 11; i++) {
-        memset(&CTX.application, 0, sizeof(CTX.application));
-        CTX.application.nwk.destination = 0x4321; CTX.application.aps.cluster_id = 0x0033;
-        memcpy(CTX.application.payload, "\xe0\x00", 2); CTX.application.length = 2;
-        if (!i) CTX.application.length = 0;
-        if (i == 1) CTX.application.length = 1;
-        if (i == 2) CTX.application.nwk.destination = 0xfffd;
-        if (i == 3) CTX.application.aps.delivery_mode = APS_DELIVERY_BROADCAST;
-        if (i == 4) CTX.application.aps.profile_id = 0x0104;
-        if (i == 5) CTX.application.aps.destination_endpoint = 1;
-        if (i == 6) CTX.application.aps.source_endpoint = 7;
-        if (i == 7) CTX.application.aps.type = ED_APS_ACK;
-        if (i == 8) CTX.application.aps.cluster_id = 0x8033;
-        if (i == 9) CTX.application.length = ED_PAYLOAD_MAX+1u;
-        if (i == 10) CTX.application.aps.source_endpoint = 0xff;
-        before = ST; CTX.application_ready = 1;
-        CHECK(zcl_sensor_serve() == ZCL_SENSOR_DISCARDED && !CTX.response_pending);
-        CHECK(!memcmp(ST.bound, before.bound, sizeof(ST.bound)) &&
-              !memcmp(ST.report, before.report, sizeof(ST.report)));
-        CTX.application_ready = 0;
-    }
+    CHECK(zdo(0x0033, "\x91\x00", 2) == ZCL_SENSOR_HANDLED);
+    reply(0x8033, "\x91\x84", 2);
+    CHECK(zdo(0x0033, "\x92\x05\x77", 3) == ZCL_SENSOR_HANDLED);
+    reply(0x8033, "\x92\x84", 2);
+    CHECK(!memcmp(ST.bound, before.bound, sizeof(ST.bound)) && !memcmp(ST.report, before.report, sizeof(ST.report)));
+    CHECK(ST.basic == before.basic && ST.pending == before.pending && ST.sent == before.sent && ST.tsn == before.tsn);
+    CHECK(zdo(0x0033, "\x93", 1) == ZCL_SENSOR_DISCARDED && !CTX.response_pending);
     CTX.response_pending = 1; memset(&CTX.response, 0xa5, sizeof(CTX.response)); occupied = CTX.response;
     CHECK(zdo(0x0033, "\xe1\x00", 2) == ZCL_SENSOR_DISCARDED);
     CHECK(CTX.response_result == NWK_APS_FULL && !memcmp(&CTX.response, &occupied, sizeof(occupied)));
     CTX.response_pending = 0;
     memset(&identity, 0, sizeof(identity)); before = ST;
     CHECK(!zcl_sensor_init(&identity) && !memcmp(&ST, &before, sizeof(ST)));
-    memset(join_smoke_device.config.association.extraction.local, 0, 8);
-    memset(output, 0xa5, sizeof(output));
-    CHECK(!zcl_sensor_binding_page(0xe2, 0, output+1, ED_PAYLOAD_MAX));
-    for (i = 0; i < sizeof(output); i++) CHECK(output[i] == 0xa5);
-    reset(0);
-    memset(ST.tc_ieee, 0, 8);
-    CHECK(!zcl_sensor_binding_page(0xe3, 0, output+1, ED_PAYLOAD_MAX));
-    for (i = 0; i < sizeof(output); i++) CHECK(output[i] == 0xa5);
 }
 
-static void sensed(long millivolts, long centi, uint8_t stuck)
+/* extra: STOPs without a START (the init bus clear). */
+static void bus_idle(unsigned extra)
 {
-    adc_set(millivolts, centi, stuck);
-    adc.atest = 0x5a;
+    CHECK(sht.mode == BUS_IDLE && !sht.pull && !(SOC_P1DIR & (SDA | SCL)) && !sht.latch && !sht3x.bus);
+    CHECK(level(SDA) && level(SCL) && !sht.unknown && sht.starts + extra == sht.stops);
 }
 
-static void chip(void)
+static void climate_read(int16_t centi, uint16_t humidity)
+{
+    uint8_t expected[9];
+    memcpy(expected, "\x18\x50\x01\x00\x00\x00\x29", 7);
+    expected[7] = (uint8_t)centi; expected[8] = (uint8_t)((uint16_t)centi >> 8);
+    zcl(0x0402, "\x00\x50\x00\x00\x00", 5, expected, 9);
+    memcpy(expected, "\x18\x51\x01\x00\x00\x00\x21", 7);
+    expected[7] = (uint8_t)humidity; expected[8] = (uint8_t)(humidity >> 8);
+    zcl(0x0405, "\x00\x51\x00\x00\x00", 5, expected, 9);
+}
+
+static void period(void)
+{
+    CTX.last += ZCL_SENSOR_MEASURE*ZCL_SENSOR_SECOND;
+    zcl_sensor_tick();
+}
+
+static void sensors(void)
 {
     static const uint8_t power[] = {0x00, 0x40, 0x00, 0x20, 0x00, 0x21, 0x00};
     static const uint8_t device[] = {0x00, 0x41, 0x00, 0x00, 0x00};
     uint8_t expected[40];
     uint32_t t;
-    unsigned i;
-    /* Init measures once: four VDD then one discarded and eight sensor
-     * conversions, ATEST restored, TR0 off, no overlapping conversion. */
-    sensed(3000, 2500, 0); reset(5ul << 22);
-    CHECK(adc.vdd == 4 && adc.temperature == 9 && adc.conversions == 13 && !adc.foreign);
-    CHECK(!adc.unsensed && !adc.overlapped && adc.atest == 0x5a && !adc.tr0 && !(SOC_ADCCON1 & 0x80u));
-    CHECK(abs(ST.millivolts - 3000) <= 2 && abs(ST.temperature - 2500) <= 3);
-    CHECK(ST.report[0].last == (uint16_t)ST.temperature);
+    unsigned i, measures;
+    /* Init: four VDD conversions; the SHT3x claims only its two pins, clocks
+     * the bus clear (a STOP without START), starts, polls through three busy
+     * NACKs, reads once and starts the next measurement. */
+    adc_set(3000, 0); sht_set(2134, 4567, 1); sht.busy = 3;
+    SOC_P1SEL = 0xffu; SOC_P1 = 0xffu; SOC_P1DIR = 0x02u;
+    reset(5ul << 22);
+    CHECK(SOC_P1SEL == (uint8_t)~(SDA | SCL) && SOC_P1 == (uint8_t)~(SDA | SCL) && SOC_P1DIR == 0x02u);
+    SOC_P1DIR = 0;
+    CHECK(adc.conversions == 4 && !adc.foreign && !adc.overlapped && !(SOC_ADCCON1 & 0x80u));
+    CHECK(abs(ST.millivolts - 3000) <= 2);
+    CHECK(sht.measures == 2 && sht.nacked == 3 && sht.reads == 1 && sht.results == 1 && sht.starts == 6);
+    bus_idle(1);
+    CHECK(abs(sht3x.centi - 2134) <= 1 && abs((int)sht3x.humidity - 4567) <= 1);
+    CHECK(ST.report[0].last == (uint16_t)sht3x.centi && ST.report[1].last == sht3x.humidity);
     CHECK(ST.report[2].last == 30 && ST.report[3].last == 200);
+    climate_read(sht3x.centi, sht3x.humidity);
     zcl(0x0001, power, sizeof(power), "\x18\x40\x01\x20\x00\x00\x20\x1e\x21\x00\x00\x20\xc8", 13);
     zcl(0x0002, device, sizeof(device), "\x18\x41\x0b\x00\xc3", 5);
-    memcpy(expected, "\x18\x42\x01\x00\x00\x00\x29", 7);
-    expected[7] = (uint8_t)ST.temperature; expected[8] = (uint8_t)((uint16_t)ST.temperature >> 8);
-    zcl(0x0402, "\x00\x42\x00\x00\x00", 5, expected, 9);
+    zcl(0x0402, "\x00\x45\x00\x01\x00\x02\x00", 7,
+        "\x18\x45\x01\x01\x00\x00\x29\x60\xf0\x02\x00\x00\x29\xd4\x30", 15);
+    zcl(0x0405, "\x00\x46\x00\x01\x00\x02\x00", 7,
+        "\x18\x46\x01\x01\x00\x00\x21\x00\x00\x02\x00\x00\x21\x10\x27", 15);
     memcpy(expected, "\x18\x43\x01\x05\x00\x00\x42", 7); expected[7] = sizeof(model)-1;
     CHECK(sizeof(model)-1 <= sizeof(expected)-8); memcpy(expected+8, model, sizeof(model)-1);
     zcl(0x0000, "\x00\x43\x00\x05\x00", 5, expected, (uint8_t)(8+sizeof(model)-1));
     memcpy(expected, "\x18\x44\x01\x04\x00\x00\x42", 7); expected[7] = sizeof(manufacturer)-1;
     CHECK(sizeof(manufacturer)-1 <= sizeof(expected)-8); memcpy(expected+8, manufacturer, sizeof(manufacturer)-1);
     zcl(0x0000, "\x00\x44\x00\x04\x00", 5, expected, (uint8_t)(8+sizeof(manufacturer)-1));
-    /* Cadence: nine whole seconds do not measure, the tenth does. */
-    adc_set(2500, -1100, 0);
+    /* Cadence: nine whole seconds do not measure, the tenth does; it returns
+     * the SHT3x result started one period earlier. */
+    adc_set(2500, 0);
+    sht.t = (uint16_t)((30.0 + 45.0) / 175.0 * 65535.0 + 0.5); sht.starts = sht.stops = 0; sht.busy = sht.wait = 0;
     for (i = 1, t = CTX.last; i < ZCL_SENSOR_MEASURE; i++) {
         CTX.last = t + i*ZCL_SENSOR_SECOND; zcl_sensor_tick();
-        CHECK(!adc.conversions && ST.measured == i);
+        CHECK(!adc.conversions && ST.measured == i && sht.measures == 2);
     }
     CTX.last = t + ZCL_SENSOR_MEASURE*ZCL_SENSOR_SECOND - 1u; zcl_sensor_tick();
     CHECK(!adc.conversions);
     CTX.last += 1u; zcl_sensor_tick();
-    CHECK(adc.conversions == 13 && !ST.measured && !adc.unsensed && !adc.overlapped);
-    CHECK(abs(ST.millivolts - 2500) <= 2 && abs(ST.temperature + 1100) <= 3);
+    CHECK(adc.conversions == 4 && !ST.measured && !adc.overlapped && abs(ST.millivolts - 2500) <= 2);
+    CHECK(abs(sht3x.centi - 2134) <= 1 && sht.measures == 3 && sht.reads == 2 && sht.starts == 2);
+    bus_idle(0);
     zcl(0x0001, power, sizeof(power), "\x18\x40\x01\x20\x00\x00\x20\x19\x21\x00\x00\x20\x64", 13);
+    period();
+    CHECK(abs(sht3x.centi - 3000) <= 1 && sht.measures == 4 && sht.reads == 3);
+    climate_read(sht3x.centi, sht3x.humidity);
     /* A long gap measures once, saturating the second count meanwhile. */
-    adc_set(3300, 4100, 0);
+    adc_set(3300, 0);
     CTX.last += 1000ul*ZCL_SENSOR_SECOND; zcl_sensor_tick();
-    CHECK(adc.conversions == 13 && !ST.measured && abs(ST.temperature - 4100) <= 3);
+    CHECK(adc.conversions == 4 && !ST.measured && sht.measures == 5);
     zcl(0x0001, power, sizeof(power), "\x18\x40\x01\x20\x00\x00\x20\x21\x21\x00\x00\x20\xc8", 13);
-    /* A conversion that never ends publishes invalid values and stops
-     * after the first VDD poll bound; the sensor is never enabled. */
-    adc_set(3000, 2500, 1);
-    CTX.last += ZCL_SENSOR_MEASURE*ZCL_SENSOR_SECOND; zcl_sensor_tick();
-    CHECK(adc.conversions == 1 && !adc.temperature && !adc.tr0 && adc.atest == 0x5a);
-    CHECK(ST.temperature == ZCL_SENSOR_INVALID_TEMPERATURE && !ST.millivolts);
+    /* A conversion that never ends stops after the first poll bound and
+     * publishes invalid battery values; the SHT3x is still read. */
+    adc_set(3000, 1);
+    period();
+    CHECK(adc.conversions == 1 && !ST.millivolts && abs(sht3x.centi - 3000) <= 1);
     zcl(0x0001, power, sizeof(power), "\x18\x40\x01\x20\x00\x00\x20\xff\x21\x00\x00\x20\xff", 13);
+    adc_set(3000, 0);
+    period();
+    CHECK(abs(ST.millivolts - 3000) <= 2 && adc.conversions == 4);
+    /* A corrupted humidity CRC invalidates both; the next period recovers. */
+    sht.corrupt = 1;
+    period(); period();
+    CHECK(sht3x.centi == SHT3X_INVALID_CENTI && sht3x.humidity == SHT3X_INVALID_HUMIDITY);
+    climate_read(SHT3X_INVALID_CENTI, SHT3X_INVALID_HUMIDITY);
+    period();
+    CHECK(abs(sht3x.centi - 3000) <= 1 && abs((int)sht3x.humidity - 4567) <= 1);
+    /* A held SCL (bounded wait) invalidates and flags the period. */
+    sht.stuck = 1; sht.starts = sht.stops = 0;
+    period();
+    CHECK(sht3x.centi == SHT3X_INVALID_CENTI && sht3x.bus && !sht.starts);
+    sht.stuck = 0;
+    period(); period();
+    CHECK(abs(sht3x.centi - 3000) <= 1 && !sht3x.bus);
+    /* A removed sensor NACKs: invalid at the next period, no data clocked. */
+    sht.present = 0; measures = sht.measures;
+    period();
+    CHECK(sht3x.centi == SHT3X_INVALID_CENTI && sht3x.humidity == SHT3X_INVALID_HUMIDITY);
+    CHECK(sht.measures == measures);
     zcl(0x0402, "\x00\x42\x00\x00\x00", 5, "\x18\x42\x01\x00\x00\x00\x29\x00\x80", 9);
-    /* Recovery on the next measurement. */
-    adc_set(3000, 2500, 0);
-    CTX.last += ZCL_SENSOR_MEASURE*ZCL_SENSOR_SECOND; zcl_sensor_tick();
-    CHECK(abs(ST.millivolts - 3000) <= 2 && abs(ST.temperature - 2500) <= 3 && adc.conversions == 13);
-    /* A stuck sensor conversion invalidates both and restores ATEST and TR0. */
-    sensed(3000, 2500, 2);
-    CTX.last += ZCL_SENSOR_MEASURE*ZCL_SENSOR_SECOND; zcl_sensor_tick();
-    CHECK(adc.vdd == 4 && adc.temperature == 1 && adc.atest == 0x5a && !adc.tr0);
-    CHECK(ST.temperature == ZCL_SENSOR_INVALID_TEMPERATURE && !ST.millivolts);
+    /* Absent at init: the start command is NACKed, so no read header polls. */
+    adc_set(3000, 0); sht_set(2500, 5000, 0);
+    reset(5ul << 22);
+    CHECK(sht.starts == 2 && !sht.nacked && !sht.measures && sht3x.centi == SHT3X_INVALID_CENTI);
+    bus_idle(1);
+    /* A sensor that never finishes bounds the init poll. */
+    sht_set(2500, 5000, 1); sht.busy = 60000u;
+    reset(5ul << 22);
+    CHECK(sht.nacked == SHT3X_POLLS && sht3x.humidity == SHT3X_INVALID_HUMIDITY);
     /* Changed values report through the existing scheduler. */
-    adc_set(3000, 3100, 0);
-    ST.report[0].age = 0xff; ST.report[0].last = 0; ST.basic = 0; ST.bound[0] = 1; ST.bound[1] = ST.bound[2] = 0;
+    sht_set(2500, 5000, 1); reset(5ul << 22);
+    sht.t = (uint16_t)((31.0 + 45.0) / 175.0 * 65535.0 + 0.5);
+    ST.basic = 0; ST.bound[0] = ST.bound[1] = 1; ST.bound[2] = 0;
+    period();
     CTX.last += ZCL_SENSOR_MEASURE*ZCL_SENSOR_SECOND;
-    zcl_sensor_tick();
-    CHECK(abs(ST.temperature - 3100) <= 3 && report(0x0402, 0, 0x29, (uint16_t)ST.temperature));
+    ST.report[0].age = 0xff;
+    CHECK(abs(sht3x.centi - 2500) <= 1);
+    CHECK(report(0x0402, 0, 0x29, (uint16_t)SHT3X_CENTI(sht.t)));
+    CHECK(abs(sht3x.centi - 3100) <= 1);
     idle();
+    /* The shift-and-add scaling matches the conversion macros exactly. */
+    for (i = 0; i <= 0x10000u; i += i < 4u || i > 0xfff8u ? 1u : 0x3c7u) {
+        sht.t = (uint16_t)i; sht.h = (uint16_t)~i;
+        period(); period();
+        CHECK(sht3x.centi == SHT3X_CENTI(i) && sht3x.humidity == SHT3X_HUMIDITY((uint16_t)~i));
+    }
+    for (i = 1; i <= 2048u; i++) {
+        adc.millivolts = (long)((i > 2047u ? 2047u : i) * 3450u / 2048u);
+        period();
+        CHECK(ST.millivolts == ZCL_SENSOR_MILLIVOLTS(4 * ((adc.millivolts*2048 + 1725) / 3450)));
+    }
+    sht_set(2500, 5000, 1);
 }
 
 /* The board links the panel driver; the display cluster is served from its
  * store. */
 volatile uint8_t SOC_P0, SOC_P0DIR, SOC_P0SEL, SOC_P0INP, SOC_APCFG, SOC_PERCFG, SOC_P2DIR;
-volatile uint8_t SOC_P1, SOC_P1DIR, SOC_P1SEL;
 volatile uint8_t SOC_U0CSR, SOC_U0DBUF, SOC_U0BAUD, SOC_U0UCR, SOC_U0GCR;
 MCU_XDATA radio_autoack_attempt_t mac_attempt_raw;
+
+/* The parent's LQI: keys_parent is the key status router parent (0: none,
+ * the stub fails while keys_ok is clear, so other tests never request). */
+static uint8_t keys_ok;
+static uint16_t keys_parent;
+security_keys_result_t security_keys_status(security_keys_status_t *output)
+{
+    if (!keys_ok) return SECURITY_KEYS_STATE;
+    memset(output, 0, sizeof(*output));
+    output->config.address = 0x4321;
+    output->router_active = keys_parent != 0;
+    output->router_address = keys_parent;
+    return SECURITY_KEYS_OK;
+}
+
+/* Expects a Mgmt_Lqi_req for start to keys_parent; returns its sequence. */
+static uint8_t lqi_request(uint8_t start)
+{
+    uint8_t tsn;
+    CHECK(CTX.response_pending && CTX.response.aps.cluster_id == 0x0031 && CTX.response.length == 2);
+    CHECK(CTX.response.nwk.destination == keys_parent && CTX.response.payload[1] == start);
+    CHECK(!CTX.response.aps.profile_id && !CTX.response.aps.destination_endpoint && !CTX.response.aps.flags);
+    tsn = CTX.response.payload[0];
+    CTX.response_pending = 0;
+    return tsn;
+}
+
+/* Mgmt_Lqi_rsp from source: total entries, start, count entries with short
+ * addresses first, first+1, ... and LQIs 100, 101, ... */
+static uint8_t lqi_response(uint16_t source, uint8_t tsn, uint8_t status, uint8_t total, uint8_t start,
+    uint8_t count, uint16_t first)
+{
+    uint8_t p[5 + 3*22], i;
+    memset(p, 0x5a, sizeof(p));
+    p[0] = tsn; p[1] = status; p[2] = total; p[3] = start; p[4] = count;
+    for (i = 0; i < count; i++) {
+        p[5 + 22*i + 16] = (uint8_t)(first + i); p[5 + 22*i + 17] = (uint8_t)((first + i) >> 8);
+        p[5 + 22*i + 21] = (uint8_t)(100u + i);
+    }
+    memset(&CTX.application, 0, sizeof(CTX.application));
+    CTX.application.nwk.source = source; CTX.application.nwk.destination = 0x4321;
+    CTX.application.aps.cluster_id = 0x8031;
+    memcpy(CTX.application.payload, p, 5u + 22u*count); CTX.application.length = (uint8_t)(5u + 22u*count);
+    CTX.application_ready = 1;
+    i = zcl_sensor_serve();
+    CTX.application_ready = 0;
+    memset(&CTX.application, 0, sizeof(CTX.application));
+    return i;
+}
+
+static void seconds(uint16_t n)
+{
+    CTX.last += n*ZCL_SENSOR_SECOND;
+    zcl_sensor_tick();
+}
+
+static void parent_lqi(void)
+{
+    uint8_t tsn;
+    reset(0);
+    ST.basic = 0; ST.bound[0] = ST.bound[1] = ST.bound[2] = 0;
+    keys_ok = 1; keys_parent = 0x1234;
+    epd_l8.linked = 0;
+    /* The first request 15 s after READY, never while the slot is busy. */
+    seconds(14); idle(); CHECK(!CTX.response_pending);
+    seconds(1);
+    CTX.response_tx = 1; idle(); CHECK(!CTX.response_pending);
+    CTX.response_tx = 0; CTX.query = 1; idle(); CHECK(!CTX.response_pending);
+    CTX.query = 0; idle();
+    tsn = lqi_request(0);
+    /* Wrong source, sequence, status, start or truncation are discarded. */
+    CHECK(lqi_response(0x0000, tsn, 0, 4, 0, 1, 0x4321) == ZCL_SENSOR_DISCARDED);
+    CHECK(lqi_response(0x1234, (uint8_t)(tsn + 1u), 0, 4, 0, 1, 0x4321) == ZCL_SENSOR_DISCARDED);
+    CHECK(lqi_response(0x1234, tsn, 0x84, 4, 0, 1, 0x4321) == ZCL_SENSOR_DISCARDED);
+    CHECK(lqi_response(0x1234, tsn, 0, 4, 1, 1, 0x4321) == ZCL_SENSOR_DISCARDED);
+    CHECK(!epd_l8.linked);
+    /* Not on the first page (3 of 4): the next page right away. */
+    CHECK(lqi_response(0x1234, tsn, 0, 4, 0, 3, 0x0001) == ZCL_SENSOR_HANDLED && !epd_l8.linked);
+    idle();
+    tsn = lqi_request(3);
+    CHECK(lqi_response(0x1234, tsn, 0, 4, 3, 1, 0x4321) == ZCL_SENSOR_HANDLED);
+    CHECK(epd_l8.linked && epd_l8.lqi == 100);
+    CHECK(lqi_response(0x1234, tsn, 0, 4, 3, 1, 0x4321) == ZCL_SENSOR_DISCARDED);
+    /* Found again from the start every period; the third entry has LQI 102. */
+    seconds(299); idle(); CHECK(!CTX.response_pending);
+    seconds(1); idle();
+    tsn = lqi_request(0);
+    CHECK(lqi_response(0x1234, tsn, 0, 3, 0, 3, 0x431f) == ZCL_SENSOR_HANDLED && epd_l8.lqi == 102);
+    /* Absent from the whole table: unknown, from the start next time. */
+    seconds(300); idle();
+    tsn = lqi_request(0);
+    CHECK(lqi_response(0x1234, tsn, 0, 2, 0, 2, 0x0001) == ZCL_SENSOR_HANDLED && !epd_l8.linked);
+    /* An unanswered request forgets the value; the coordinator parent is 0. */
+    epd_l8.linked = 1;
+    keys_parent = 0;
+    seconds(300); idle();
+    tsn = lqi_request(0);
+    CHECK(epd_l8.linked);
+    seconds(300); idle();
+    CHECK(!epd_l8.linked);
+    tsn = lqi_request(0);
+    CHECK(lqi_response(0x0000, tsn, 0, 1, 0, 1, 0x4321) == ZCL_SENSOR_HANDLED && epd_l8.linked);
+    keys_ok = 0;
+}
 
 #define PRIVET "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82"
 static void l8(void)
@@ -871,17 +971,13 @@ static void hooks(void)
     epd.state = EPD_IDLE;
 }
 
-int main(int argc, char **argv)
+int main(void)
 {
-    if (argc == 2 && !strcmp(argv[1], "mgmt-bind")) {
-        management_bind();
-        printf("Mgmt Bind initial live table: %lu checks PASS.\n", checks);
-        return 0;
-    }
-    sensed(3000, 2500, 0);
+    adc_set(3000, 0); sht_set(2500, 5000, 1);
     management_bind(); read_reporting(); values(); defaults_and_discards(); identify(); configure(); bind();
-    chip();
+    sensors();
     l8();
+    parent_lqi();
     hooks();
     printf("ZCL dashboard: %lu checks PASS (host only).\n", checks);
     return 0;

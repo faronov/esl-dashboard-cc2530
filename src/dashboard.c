@@ -45,7 +45,7 @@ static void MCU_COMMON_CODE l8_prepare(void)
     epd_l8.time = epd_l8.tick = epd_l8.written = epd_l8.started = 0;
     epd_l8.interval = 300;
     epd_l8.outdoor = (int16_t)-0x8000;
-    epd_l8.weather = epd_l8.dirty = epd_l8.heard = 0;
+    epd_l8.weather = epd_l8.dirty = epd_l8.heard = epd_l8.linked = 0;
     epd_l8.ready = 1;
 }
 
@@ -355,6 +355,12 @@ void epd_format(epd_view_t MCU_XDATA *view, int16_t centi, uint16_t humidity, ui
         dbm = (int16_t)(int8_t)epd_l8.rssi - 73;
         if (dbm < 0) { *p++ = L8_MINUS; dbm = (int16_t)-dbm; }
         p = l8_decimal(p, (uint16_t)dbm);
+    }
+    *p++ = G(' '); *p++ = G('L'); *p++ = G('Q'); *p++ = G('I'); *p++ = G(' ');
+    if (!epd_l8.linked) {
+        *p++ = L8_MINUS; *p++ = L8_MINUS;
+    } else {
+        p = l8_decimal(p, epd_l8.lqi);
     }
     *p = EPD_L8_END;
     l8_clock(view->clock, epd_l8.time);
