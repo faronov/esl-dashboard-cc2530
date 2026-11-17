@@ -26,6 +26,7 @@ volatile uint8_t SOC_U0CSR, SOC_U0DBUF, SOC_U0BAUD, SOC_U0UCR, SOC_U0GCR;
 #define PLANE (EPD_ROWS * EPD_OCTETS)
 #define LOG 64
 #define REFRESH_MS 3200u
+#define PARTIAL_MS 600u
 
 static uint32_t now;
 static struct {
@@ -34,7 +35,7 @@ static struct {
     uint8_t command, mode, misframed, misdc, unpowered, unready, asleep;
     uint32_t busy_until;
     uint8_t log[LOG], data[LOG][5], data_n[LOG], n;
-    uint8_t plane[PLANE];
+    uint8_t plane[PLANE], old[PLANE];
     uint32_t plane_n, other;
     int refreshes;
 } m;
@@ -65,7 +66,7 @@ static void model_byte(uint8_t value)
         if (m.n < LOG) { m.log[m.n] = value; m.data_n[m.n++] = 0; }
         if (value == 0x12u) m.busy_until = now + EPD_MS(10);
         if (value == 0x20u) {
-            m.busy_until = now + EPD_MS(REFRESH_MS);
+            m.busy_until = now + EPD_MS(m.mode == 0xffu ? PARTIAL_MS : REFRESH_MS);
             m.refreshes++;
             if (m.refresh_stuck) m.refresh_hold = 1;
         }
@@ -76,7 +77,11 @@ static void model_byte(uint8_t value)
         m.plane_n++;
         return;
     }
-    if (m.command == 0x26u) { m.other++; return; }
+    if (m.command == 0x26u) {
+        if (m.other < PLANE) m.old[m.other] = value;
+        m.other++;
+        return;
+    }
     if (m.command == 0x22u) m.mode = value;
     if (m.command == 0x10u && value == 0x01u) m.sleeping = 1;
     if (m.n && m.data_n[m.n-1u] < 5u) m.data[m.n-1u][m.data_n[m.n-1u]++] = value;
@@ -307,6 +312,85 @@ static void test_refresh(void)
     CHECK(run(EPD_SECONDS(5)));
 }
 
+static uint32_t view_crc(const epd_view_t MCU_XDATA *view)
+{
+    static uint8_t plane[PLANE];
+    uint16_t row;
+    for (row = 0; row < EPD_ROWS; row++) {
+        epd_render(view, row);
+        memcpy(plane + row * EPD_OCTETS, epd.column, EPD_OCTETS);
+    }
+    return crc32(plane, PLANE);
+}
+
+static const uint8_t partial_sequence[] = {
+    0x12, 0x18, 0x0c, 0x01, 0x3c, 0x11, 0x44, 0x45, 0x4e, 0x4f, 0x26, 0x4e, 0x4f, 0x24, 0x3c, 0x22, 0x20, 0x10
+};
+
+/* Message n changes the view; the refresh runs to its end. */
+static void change(unsigned n)
+{
+    char text[16];
+    snprintf(text, sizeof(text), "Message %u", n);
+    CHECK(!set_text(0x0030, text));
+    now += EPD_L8_SPACING;
+    memset(&m, 0, sizeof(m));
+    epd_show(now, 2000, 5000, 3000);
+    CHECK(epd.state == EPD_RESET);
+    CHECK(run(EPD_SECONDS(5)) && !epd.failures);
+}
+
+/* After a full refresh, changes refresh partially: the view shown last as
+ * the previous image (0x26), then the new one, 22 FF. Every
+ * EPD_PARTIALS + 1-th refresh and the one after a failure are full. */
+static void test_partial(void)
+{
+    uint32_t shown, limit;
+    unsigned i, n = 0;
+    boot();
+    now = 1000;
+    epd_show(now, 2000, 5000, 3000);
+    CHECK(!epd.partial);
+    CHECK(run(EPD_SECONDS(5)) && epd.shown && !m.other && epd.partial);
+    for (i = 0; i < EPD_PARTIALS; i++) {
+        shown = view_crc(&epd.old);
+        change(n++);
+        CHECK(epd.partials == i + 1u && epd.shown && epd.partial == (i + 1u < EPD_PARTIALS));
+        CHECK(m.n == sizeof(partial_sequence) && !memcmp(m.log, partial_sequence, sizeof(partial_sequence)));
+        CHECK(m.data_n[14] == 1 && m.data[14][0] == 0x80 && m.data[15][0] == 0xff && m.data[17][0] == 0x01);
+        CHECK(m.other == PLANE && m.plane_n == PLANE && crc32(m.old, PLANE) == shown);
+        CHECK(crc32(m.plane, PLANE) == view_crc(&epd.old) && crc32(m.plane, PLANE) != shown);
+        CHECK(!m.misframed && !m.misdc && !m.unpowered && !m.unready && !m.asleep);
+        CHECK(epd.duration <= (EPD_MS(PARTIAL_MS + 200u) >> 6));
+    }
+    change(n++);
+    CHECK(!epd.partials && epd.partial);
+    check_sequence();
+    change(n++);
+    CHECK(epd.partial && epd.partials == 1);
+    /* PM2 stays bounded while the panel refreshes. */
+    CHECK(!set_text(0x0030, "x"));
+    now += EPD_L8_SPACING;
+    epd_show(now, 2000, 5000, 3000);
+    while (epd.state != EPD_REFRESH && epd.state != EPD_IDLE) { epd_step(now); now += EPD_MS(1); }
+    limit = epd_sleep_limit(now);
+    CHECK(epd.state == EPD_REFRESH && limit > 0 && limit <= EPD_REFRESH_EXPECTED);
+    CHECK(run(EPD_SECONDS(5)));
+    /* A failed refresh makes the next one full. */
+    CHECK(!set_text(0x0030, "y"));
+    now += EPD_L8_SPACING;
+    m.refresh_stuck = 1;
+    epd_show(now, 2000, 5000, 3000);
+    CHECK(epd.partial);
+    CHECK(run(EPD_SECONDS(40)) && epd.failures == 1 && !epd.shown && !epd.partial);
+    /* Writes do not hurry a refresh after a failure; the due one runs. */
+    memset(&m, 0, sizeof(m));
+    now = epd.due;
+    epd_show(now, 2000, 5000, 3000);
+    CHECK(epd.state == EPD_RESET && !epd.partial && run(EPD_SECONDS(5)));
+    CHECK(epd.shown && epd.partial && !m.other && m.plane_n == PLANE);
+}
+
 static void test_store(void)
 {
     uint8_t out[80], in[200];
@@ -378,6 +462,7 @@ int main(int argc, char **argv)
 {
     test_render(argc > 1 ? argv[1] : NULL);
     test_refresh();
+    test_partial();
     test_store();
     test_failures();
     if (failures) { fprintf(stderr, "test_display: %d failure(s)\n", failures); return 1; }

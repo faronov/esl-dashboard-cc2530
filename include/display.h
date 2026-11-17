@@ -34,6 +34,8 @@
 #define EPD_REFRESH_LIMIT EPD_MS(30000)
 #define EPD_SLEEP_POLL EPD_MS(250)
 #define EPD_REFRESH_EXPECTED EPD_MS(3300)
+/* Partial refreshes between two full ones. */
+#define EPD_PARTIALS 12u
 /* An unchanged view is compared again after CHECK. */
 #define EPD_CHECK EPD_SECONDS(10)
 /* No indoor humidity sensor: L8 shows --. */
@@ -43,17 +45,6 @@ enum {
     EPD_IDLE = 0, EPD_RESET, EPD_BOOT, EPD_POWER, EPD_OLD, EPD_NEW, EPD_LOAD, EPD_REFRESH, EPD_OFF
 };
 
-/* L8 (tools/epd/l8_art.py, docs/DISPLAY.md): what the panel shows besides
- * the epd_l8 texts, as glyph codes (ASCII 20..7E as 0..94, U+0410..U+044F
- * as 95..158, Ё 159, ё 160, ° 161) ending at 0xFF: battery gauge fill
- * (0..36 columns), weather icon (0 none, 1..9), voltage, RSSI, clock, and
- * the indoor and outdoor temperature and humidity. */
-#define EPD_L8_END 0xffu
-typedef struct {
-    uint8_t fill, weather;
-    uint8_t volt[7], rssi[10], clock[15];
-    uint8_t indoor[7], humidity[4], outdoor[7], outdoor_humidity[4];
-} epd_view_t;
 
 /* Cluster 0xFC10 on the application endpoint, pushed by Home Assistant
  * (docs/DISPLAY.md). time: local seconds since 2000-01-01 00:00 (0 unknown),
@@ -63,11 +54,26 @@ typedef struct {
  * the message are glyph codes padded with EPD_L8_END. dirty: a write
  * changed what is shown; written: the last write; started: the last
  * refresh start; heard/rssi: the last received frame's raw RSSI. */
+#define EPD_L8_END 0xffu
 #define EPD_L8_CLUSTER 0xfc10u
 #define EPD_L8_SLOTS 4u
 #define EPD_L8_LABEL 22u
 #define EPD_L8_VALUE 12u
 #define EPD_L8_MESSAGE 48u
+/* L8 (tools/epd/l8_art.py, docs/DISPLAY.md): everything the panel shows,
+ * as glyph codes (ASCII 20..7E as 0..94, U+0410..U+044F as 95..158, Ё 159,
+ * ё 160, ° 161) ending at or padded with EPD_L8_END: battery gauge fill
+ * (0..36 columns), weather icon (0 none, 1..9), voltage, RSSI, clock, the
+ * indoor and outdoor temperature and humidity, and copies of the epd_l8
+ * slot texts and message, so a view shown last can be drawn again. */
+typedef struct {
+    uint8_t fill, weather;
+    uint8_t volt[7], rssi[10], clock[15];
+    uint8_t indoor[7], humidity[4], outdoor[7], outdoor_humidity[4];
+    uint8_t label[EPD_L8_SLOTS][EPD_L8_LABEL], value[EPD_L8_SLOTS][EPD_L8_VALUE];
+    uint8_t message[EPD_L8_MESSAGE];
+} epd_view_t;
+
 /* Writes wait until the last one is EPD_L8_SETTLE old and the last refresh
  * started EPD_L8_SPACING before. */
 #define EPD_L8_SETTLE EPD_SECONDS(10)
@@ -83,8 +89,9 @@ typedef struct {
 
 /* armed: a refresh was started once (due is valid); shown: old is on the
  * panel (cleared by a failure, so the next refresh is a full one); partial:
- * the running refresh is partial; partials: partial refreshes since the
- * last full one; failed: the state of the last failure (0 none); duration:
+ * the next or running refresh is partial (old is sent as the previous
+ * image; set by a refresh while partials < EPD_PARTIALS, cleared by a
+ * failure); partials: partial refreshes since the last full one; failed: the state of the last failure (0 none); duration:
  * the last refresh BUSY time in 1.024-ms units (symbols >> 6). */
 typedef struct {
     uint8_t state, armed, shown, partial, partials, failed, failures;

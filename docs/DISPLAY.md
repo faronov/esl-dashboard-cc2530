@@ -8,9 +8,9 @@ Assistant dashboard. Pins, the command sequence and the timing are in
 ## Driver and schedule
 
 - [`src/display.c`](../src/display.c) is a state machine advanced from every
-  READY poll (`zcl_sensor_tick`): power and reset, the boot sequence, the new
-  plane streamed `EPD_ROWS_PER_STEP` gate rows per poll, refresh (`22 F7`,
-  `20`), deep sleep (`10 01`), then the panel power is cut
+  READY poll (`zcl_sensor_tick`): power and reset, the boot sequence, the
+  planes streamed `EPD_ROWS_PER_STEP` gate rows per poll, refresh (`20`),
+  deep sleep (`10 01`), then the panel power is cut
   (`board_early_off`). Every wait is bounded; a timeout or an SPI stall powers
   the panel off and counts a failure.
 - The device sleeps in PM2 between polls. While rows stream it stays awake;
@@ -19,7 +19,14 @@ Assistant dashboard. Pins, the command sequence and the timing are in
 - The driver runs only while the network is READY. A refresh interrupted by a
   rejoin resumes when READY returns and normally fails on its 30 s limit;
   the next one starts as usual.
-- Every refresh is a full one with the panel's OTP waveform.
+- Refreshes use the panel's OTP waveforms. The first refresh after boot or
+  after a failure, and every `EPD_PARTIALS + 1`-th (13th) refresh, is full
+  (border `3C 01`, `22 F7`); the others are partial (border `3C 80`,
+  `22 FF`).
+- The panel loses power between refreshes, so a partial refresh streams both
+  planes: the previously shown view into `26` (old) and the new one into `24`.
+  The driver keeps both views (`epd.old`, `epd.next`, texts included), so the
+  old plane is exactly what the panel shows.
 
 ## Layout
 
@@ -85,7 +92,7 @@ shown (a time write only when the time was unknown) redraws the panel once
 the last write is 10 s old and the last refresh started at least 30 s
 before, so a batch of writes gives one refresh. Otherwise the panel
 refreshes every interval when the view changed (indoor values, battery,
-RSSI, clock). Each refresh is a full one (OTP waveform).
+RSSI, clock). Refreshes are partial, with a periodic full one (see "Driver and schedule").
 
 ## Home Assistant and Zigbee2MQTT
 

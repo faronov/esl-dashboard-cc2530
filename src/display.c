@@ -41,19 +41,24 @@ static const MCU_CODE uint8_t segment[10] = {
 };
 
 /* Command, data count, data; 0xff ends a list. BOOT follows the reset,
- * PANEL the BOOT BUSY wait and ends with the new plane's command, FULL the
- * new plane, SLEEP the refresh. */
+ * PANEL the BOOT BUSY wait; OLD (partial) and NEW start the previous and
+ * the new plane; FULL or PARTIAL follow the new plane, SLEEP the refresh. */
 #define READY() (!(MMIO_READ(SOC_P1) & BUSY))
 #define BOOT 0u
 #define PANEL 3u
-#define FULL 47u
-#define SLEEP 53u
+#define OLD 37u
+#define NEW 48u
+#define FULL 59u
+#define PARTIAL 65u
+#define SLEEP 74u
 static const MCU_CODE uint8_t commands[] = {
     0x12, 0, 0xff,
     0x18, 1, 0x80, 0x0c, 5, 0xae, 0xc7, 0xc3, 0xc0, 0x80, 0x01, 3, 0xdf, 0x01, 0x02, 0x3c, 1, 0x01,
-    0x11, 1, 0x03, 0x44, 4, 0x00, 0x00, 0x1f, 0x03, 0x45, 4, 0x00, 0x00, 0xdf, 0x01,
+    0x11, 1, 0x03, 0x44, 4, 0x00, 0x00, 0x1f, 0x03, 0x45, 4, 0x00, 0x00, 0xdf, 0x01, 0xff,
+    0x4e, 2, 0x00, 0x00, 0x4f, 2, 0x00, 0x00, 0x26, 0, 0xff,
     0x4e, 2, 0x00, 0x00, 0x4f, 2, 0x00, 0x00, 0x24, 0, 0xff,
     0x22, 1, 0xf7, 0x20, 0, 0xff,
+    0x3c, 1, 0x80, 0x22, 1, 0xff, 0x20, 0, 0xff,
     0x10, 1, 0x01, 0xff
 };
 
@@ -97,7 +102,7 @@ static void MCU_COMMON_CODE fail(void)
 {
     epd.failed = epd.state;
     if (epd.failures != 0xffu) epd.failures++;
-    epd.shown = 0;
+    epd.shown = epd.partial = 0;
     board_early_off();
     epd.state = EPD_IDLE;
 }
@@ -108,6 +113,7 @@ static void MCU_COMMON_CODE done(void)
     memcpy(&epd.old, &epd.next, sizeof(epd.old));
     epd.shown = 1;
     epd.partials = epd.partial ? (uint8_t)(epd.partials + 1u) : 0;
+    epd.partial = epd.partials < EPD_PARTIALS;
     epd.refreshes++;
     epd.state = EPD_IDLE;
 }
@@ -174,7 +180,9 @@ void MCU_COMMON_CODE epd_step(uint32_t now) JOIN_FAR
         case EPD_POWER:
             sequence(PANEL);
             epd.row = 0;
-            enter(EPD_NEW, now);
+            if (!epd.partial) goto plane;
+            sequence(OLD);
+            enter(EPD_OLD, now);
             return;
         case EPD_REFRESH:
             epd.duration = (uint16_t)(d >> 6);
@@ -191,17 +199,18 @@ void MCU_COMMON_CODE epd_step(uint32_t now) JOIN_FAR
     case EPD_OLD:
     case EPD_NEW:
         for (n = 0; n < EPD_ROWS_PER_STEP && epd.row != EPD_ROWS && !stalled; n++, epd.row++) {
-            if (epd.state == EPD_OLD && !epd.shown) memset(epd.column, 0xff, EPD_OCTETS);
-            else epd_render(epd.state == EPD_OLD ? &epd.old : &epd.next, epd.row);
+            epd_render(epd.state == EPD_OLD ? &epd.old : &epd.next, epd.row);
             for (i = 0; i < EPD_OCTETS; i++) send(1, epd.column[i]);
         }
         if (stalled) { fail(); return; }
         if (epd.row != EPD_ROWS) return;
         epd.row = 0;
         if (epd.state == EPD_OLD) {
+        plane:
+            sequence(NEW);
             enter(EPD_NEW, now);
         } else {
-            sequence(FULL);
+            sequence(epd.partial ? PARTIAL : FULL);
             enter(EPD_REFRESH, now);
         }
         return;

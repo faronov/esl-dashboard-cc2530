@@ -38,7 +38,7 @@ static const MCU_CODE uint8_t l8_double[16] = {
 };
 static const MCU_CODE uint8_t l8_month[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
 
-static void l8_prepare(void)
+static void MCU_COMMON_CODE l8_prepare(void)
 {
     if (epd_l8.ready) return;
     memset(&epd_l8, EPD_L8_END, sizeof(epd_l8));
@@ -221,10 +221,10 @@ void epd_render(const epd_view_t MCU_XDATA *view, uint16_t row) JOIN_FAR
     l8_number(528, 86, 796, view->outdoor, sizeof(view->outdoor), 0, fy);
     l8_number(528, 206, 796, view->outdoor_humidity, sizeof(view->outdoor_humidity), 1, fy);
     for (i = 0, x = 16; i < EPD_L8_SLOTS; i++, x += 200u) {
-        l8_text(x, 296, (uint16_t)(x + 176u), epd_l8.label[i], EPD_L8_LABEL, 1, fy);
-        l8_number(x, 324, (uint16_t)(x + 176u), epd_l8.value[i], EPD_L8_VALUE, L8_SLOT, fy);
+        l8_text(x, 296, (uint16_t)(x + 176u), view->label[i], EPD_L8_LABEL, 1, fy);
+        l8_number(x, 324, (uint16_t)(x + 176u), view->value[i], EPD_L8_VALUE, L8_SLOT, fy);
     }
-    l8_text(16, 424, 784, epd_l8.message, EPD_L8_MESSAGE, 2, fy);
+    l8_text(16, 424, 784, view->message, EPD_L8_MESSAGE, 2, fy);
 }
 
 /* --- formatting into glyph codes --- */
@@ -362,6 +362,7 @@ void epd_format(epd_view_t MCU_XDATA *view, int16_t centi, uint16_t humidity, ui
     l8_humidity(view->humidity, humidity);
     l8_temperature(view->outdoor, epd_l8.outdoor);
     l8_humidity(view->outdoor_humidity, epd_l8.outdoor_humidity);
+    memcpy(view->label, epd_l8.label, sizeof(view->label) + sizeof(view->value) + sizeof(view->message));
 }
 
 /* --- cluster 0xFC10 --- */

@@ -19,7 +19,8 @@ ZHA quirk and the Zigbee2MQTT converter in [`tools/ha/`](tools/ha) apply.
 
 - Works on hardware: joins ZHA through a router parent, reaches READY, and
   redraws the dashboard on writes from Home Assistant.
-- Every refresh is a full one; partial refresh is planned.
+- Partial refresh with a full refresh every 13th time, at boot and after a
+  failure; not yet verified on hardware.
 - Not yet qualified: sleep current.
 
 ## Layout
