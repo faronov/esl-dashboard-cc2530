@@ -49,7 +49,8 @@ MCU_XDATA uint8_t zdo_srv_descriptors[sizeof(descriptor)];
 
 /* The parent's LQI of this device (epd_l8.linked/lqi), polled like
  * e-monitor: Mgmt_Lqi_req to the parent, own entry by short address, the
- * next page while it is not found. waiting: the last request is unanswered
+ * next page while it is not found, then the found page first. waiting: the
+ * last request is unanswered
  * (the next one forgets the value); keys: scratch for the parent address. */
 static MCU_XDATA struct {
     security_keys_status_t keys;
@@ -508,14 +509,16 @@ static __attribute__((noinline)) uint8_t lqi_response(void)
     lqi.waiting = 0;
     for (; n; n--, e += LQI_ENTRY)
         if (e[16] == lo && e[17] == hi) {
+            /* The next poll asks this page first (one exchange, not a scan). */
             epd_l8.lqi = e[21];
             epd_l8.linked = 1;
-            lqi.start = 0;
             return ZCL_SENSOR_HANDLED;
         }
     lqi.start += IN[4];
     if (!IN[4] || lqi.start >= IN[2]) {
+        /* A remembered page may have started past the entry: rescan once. */
         lqi.start = 0;
+        if (epd_l8.linked) lqi.age = LQI_PERIOD;
         epd_l8.linked = 0;
     } else {
         lqi.age = LQI_PERIOD;

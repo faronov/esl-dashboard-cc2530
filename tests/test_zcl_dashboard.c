@@ -892,15 +892,28 @@ static void parent_lqi(void)
     CHECK(lqi_response(0x1234, tsn, 0, 4, 3, 1, 0x4321) == ZCL_SENSOR_HANDLED);
     CHECK(epd_l8.linked && epd_l8.lqi == 100);
     CHECK(lqi_response(0x1234, tsn, 0, 4, 3, 1, 0x4321) == ZCL_SENSOR_DISCARDED);
-    /* Found again from the start every period; the third entry has LQI 102. */
+    /* The found page first every period. */
     seconds(299); idle(); CHECK(!CTX.response_pending);
     seconds(1); idle();
+    tsn = lqi_request(3);
+    CHECK(lqi_response(0x1234, tsn, 0, 4, 3, 1, 0x4321) == ZCL_SENSOR_HANDLED && epd_l8.lqi == 100);
+    /* Moved before that page: one immediate rescan from the start; the
+     * third entry has LQI 102. */
+    seconds(300); idle();
+    tsn = lqi_request(3);
+    CHECK(lqi_response(0x1234, tsn, 0, 4, 3, 1, 0x0001) == ZCL_SENSOR_HANDLED && !epd_l8.linked);
+    idle();
     tsn = lqi_request(0);
     CHECK(lqi_response(0x1234, tsn, 0, 3, 0, 3, 0x431f) == ZCL_SENSOR_HANDLED && epd_l8.lqi == 102);
-    /* Absent from the whole table: unknown, from the start next time. */
+    /* Absent from the whole table: after the rescan unknown, from the
+     * start next time and nothing more until then. */
     seconds(300); idle();
     tsn = lqi_request(0);
     CHECK(lqi_response(0x1234, tsn, 0, 2, 0, 2, 0x0001) == ZCL_SENSOR_HANDLED && !epd_l8.linked);
+    idle();
+    tsn = lqi_request(0);
+    CHECK(lqi_response(0x1234, tsn, 0, 2, 0, 2, 0x0001) == ZCL_SENSOR_HANDLED && !epd_l8.linked);
+    idle(); CHECK(!CTX.response_pending);
     /* An unanswered request forgets the value; the coordinator parent is 0. */
     epd_l8.linked = 1;
     keys_parent = 0;
