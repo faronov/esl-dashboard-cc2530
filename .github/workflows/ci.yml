@@ -132,10 +132,25 @@ jobs:
                 f"stack {m['stack_demand']} B, hex sha256 {r['hex_sha256']}")
           PY
 
+      - name: Build 5.79" firmware
+        env:
+          RELEASE_TOOLS: ${{ steps.release.outputs.tools }}
+        run: |
+          make firmware PANEL=579 LLVM_TOOLS="${RELEASE_TOOLS:-$GITHUB_WORKSPACE/llvm-build/bin}" LLVM_SRC="$GITHUB_WORKSPACE/llvm"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("build/firmware-579/receipt.json"))
+          m = r["admission"]["measured"]
+          print(f"5.79\" firmware {r['status']}: code {m['code']} B, common {m['common']} B, "
+                f"stack {m['stack_demand']} B, hex sha256 {r['hex_sha256']}")
+          PY
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: esl-dashboard-cc2530-${{ github.sha }}
           path: |
             build/firmware/firmware.hex
             build/firmware/firmware.elf
+            build/firmware-579/firmware.hex
+            build/firmware-579/firmware.elf
             build/firmware/receipt.json

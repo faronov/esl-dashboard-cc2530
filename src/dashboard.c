@@ -16,6 +16,12 @@ extern MCU_XDATA radio_autoack_attempt_t mac_attempt_raw;
 MCU_XDATA epd_l8_t epd_l8;
 
 #define L8_WIDTH 800u
+/* Battery gauge columns at full charge. */
+#if defined(EPD_PANEL_579)
+#define EPD_FILL 28u
+#else
+#define EPD_FILL 36u
+#endif
 #define G(c) ((uint8_t)((c) - 0x20))
 #define L8_DIGIT G('0')
 #define L8_MINUS G('-')
@@ -31,11 +37,13 @@ MCU_XDATA epd_l8_t epd_l8;
 /* 7-segment number sizes: digit width w, height ht (w + 1 and ht + 1
  * pixels), half stroke h, gap between characters. Size 2 (slot values) is
  * size 1 with a narrow digit 1. */
+#if !defined(EPD_PANEL_579)
 #define L8_SLOT 2u
 static const MCU_CODE uint8_t l8_size[3][4] = { { 52, 100, 7, 10 }, { 30, 56, 4, 6 }, { 30, 56, 4, 6 } };
 static const MCU_CODE uint8_t l8_double[16] = {
     0x00, 0x03, 0x0c, 0x0f, 0x30, 0x33, 0x3c, 0x3f, 0xc0, 0xc3, 0xcc, 0xcf, 0xf0, 0xf3, 0xfc, 0xff
 };
+#endif
 static const MCU_CODE uint8_t l8_month[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
 
 static void MCU_COMMON_CODE l8_prepare(void)
@@ -60,6 +68,9 @@ static void l8_tick(uint32_t now)
     if (epd_l8.time) epd_l8.time += d;
 }
 
+#if defined(EPD_PANEL_579)
+#include "dashboard_l5.c"
+#else
 /* --- rendering into epd.column (ink clears a bit, MSB left) --- */
 static void MCU_COMMON_CODE l8_span(uint16_t x0, uint16_t x1)
 {
@@ -226,6 +237,7 @@ void epd_render(const epd_view_t MCU_XDATA *view, uint16_t row) JOIN_FAR
     }
     l8_text(16, 424, 784, view->message, EPD_L8_MESSAGE, 2, fy);
 }
+#endif
 
 /* --- formatting into glyph codes --- */
 static __attribute__((noinline)) uint8_t MCU_XDATA * MCU_COMMON_CODE l8_two(uint8_t MCU_XDATA *p, uint8_t v)
@@ -336,8 +348,8 @@ void epd_format(epd_view_t MCU_XDATA *view, int16_t centi, uint16_t humidity, ui
         epd_l8.heard = 1;
     }
 #endif
-    view->fill = millivolts <= 2000u ? 0 : millivolts >= 3000u ? 36u :
-        (uint8_t)((uint16_t)(millivolts - 2000u) * 36u / 1000u);
+    view->fill = millivolts <= 2000u ? 0 : millivolts >= 3000u ? EPD_FILL :
+        (uint8_t)((uint16_t)(millivolts - 2000u) * EPD_FILL / 1000u);
     view->weather = epd_l8.weather;
     if (!millivolts) {
         p[0] = p[2] = p[3] = L8_MINUS;
@@ -348,20 +360,31 @@ void epd_format(epd_view_t MCU_XDATA *view, int16_t centi, uint16_t humidity, ui
     }
     p[1] = L8_DOT; p[4] = G(' '); p[5] = G('V'); p[6] = EPD_L8_END;
     p = view->rssi;
+#if defined(EPD_PANEL_579)
+    view->bars = 0;
+#else
     *p++ = G('R'); *p++ = G('S'); *p++ = G('S'); *p++ = G('I'); *p++ = G(' ');
+#endif
     if (!epd_l8.heard) {
         *p++ = L8_MINUS; *p++ = L8_MINUS;
     } else {
         dbm = (int16_t)(int8_t)epd_l8.rssi - 73;
+#if defined(EPD_PANEL_579)
+        view->bars = dbm > -60 ? 4u : dbm > -70 ? 3u : dbm > -80 ? 2u : dbm > -90 ? 1u : 0;
+#endif
         if (dbm < 0) { *p++ = L8_MINUS; dbm = (int16_t)-dbm; }
         p = l8_decimal(p, (uint16_t)dbm);
     }
+#if defined(EPD_PANEL_579)
+    *p++ = G(' '); *p++ = G('d'); *p++ = G('B'); *p++ = G('m');
+#else
     *p++ = G(' '); *p++ = G('L'); *p++ = G('Q'); *p++ = G('I'); *p++ = G(' ');
     if (!epd_l8.linked) {
         *p++ = L8_MINUS; *p++ = L8_MINUS;
     } else {
         p = l8_decimal(p, epd_l8.lqi);
     }
+#endif
     *p = EPD_L8_END;
     l8_clock(view->clock, epd_l8.time);
     l8_temperature(view->indoor, centi);

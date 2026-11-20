@@ -7,6 +7,37 @@
 #include "board.h"
 #include "banked_join.h"
 
+#if defined(EPD_PANEL_579)
+/* The Waveshare 5.79" 792x272 panel (two cascaded SSD1683: commands 00..7F
+ * reach the master, the left half, the same command | 0x80 the slave, the
+ * right half; BUSY is the master's) on the LG ESL29 FPC, showing the L5
+ * dashboard (docs/DISPLAY.md). Pins and SPI as for the 4.26" panel below.
+ * Sequence (H2 evidence, ~/epd-panels p9): power, reset, 12, master 11 01,
+ * 44 00 31, 45 0F 01 00 00; slave 91 00, C4 31 00, C5 0F 01 00 00; then per
+ * plane and half 4E 00 / 4F 0F 01 / 26 or 24 (master) and CE 31 / CF 0F 01 /
+ * A6 or A4 (slave), each followed by 272 rows of 50 octets (screen rows top
+ * down: the Y counter decrements from 0x10F; the master takes octets 0..49
+ * of the 99-octet row, the slave octets 49..98); 1A and 9A with the
+ * temperature; 22 D7 (full) or 3C 80, BC 80, 22 DF (partial), 20, 10 01.
+ * A load-temperature update (22 with bit 0x20) hangs the slave (status
+ * 0xAF stays 05), so the temperature is written: the SHT3x reading as a
+ * 12-bit two's complement in 1/16 C, 20 C when unknown or outside
+ * -20 .. 70 C. A full refresh sends an all-zero previous plane. */
+#define EPD_L5 1
+/* The L5 renderer (src/dashboard_l5.c) and its tables (display_art_l5.h)
+ * share bank 6: banked code reads its own bank's constants. */
+#if defined(CC2530_CLANG)
+#define EPD_L5_CODE __attribute__((section(".bank6.text.l5")))
+#define EPD_L5_DATA __attribute__((section(".bank6.rodata.l5")))
+#else
+#define EPD_L5_CODE
+#define EPD_L5_DATA
+#endif
+#define EPD_ROWS 272u
+#define EPD_OCTETS 99u
+#define EPD_HALF 50u
+#define EPD_ROWS_PER_STEP 2u
+#else
 /* The Waveshare 4.26" 800x480 SSD1677 panel on the LG ESL29 FPC, showing
  * the L8 dashboard (docs/DISPLAY.md). Pins, H2 evidence (debugger probes):
  * - P0.7 high powers the panel; P1.1 is RST (low active), P1.2 BUSY (high
@@ -25,6 +56,7 @@
 #define EPD_ROWS 480u
 #define EPD_OCTETS 100u
 #define EPD_ROWS_PER_STEP 2u
+#endif
 /* 16-us MAC symbols. */
 #define EPD_MS(ms) ((uint32_t)(ms) * 125u / 2u)
 #define EPD_SECONDS(s) ((uint32_t)(s) * 62500UL)
@@ -66,9 +98,19 @@ enum {
  * LQI, clock, the
  * indoor and outdoor temperature and humidity, and copies of the epd_l8
  * slot texts and message, so a view shown last can be drawn again. */
+#if defined(EPD_PANEL_579)
+/* L5 (tools/epd/l5_art.py): fill 0..28 columns, bars 0..4 signal bars,
+ * rssi "-63 dBm"; the rest as in L8. */
+#define EPD_VIEW_RSSI 9u
+#define EPD_VIEW_BARS uint8_t bars;
+#else
+#define EPD_VIEW_RSSI 18u
+#define EPD_VIEW_BARS
+#endif
 typedef struct {
     uint8_t fill, weather;
-    uint8_t volt[7], rssi[18], clock[15];
+    EPD_VIEW_BARS
+    uint8_t volt[7], rssi[EPD_VIEW_RSSI], clock[15];
     uint8_t indoor[7], humidity[4], outdoor[7], outdoor_humidity[4];
     uint8_t label[EPD_L8_SLOTS][EPD_L8_LABEL], value[EPD_L8_SLOTS][EPD_L8_VALUE];
     uint8_t message[EPD_L8_MESSAGE];
@@ -93,8 +135,16 @@ typedef struct {
  * image; set by a refresh while partials < EPD_PARTIALS, cleared by a
  * failure); partials: partial refreshes since the last full one; failed: the state of the last failure (0 none); duration:
  * the last refresh BUSY time in 1.024-ms units (symbols >> 6). */
+/* L5 only: half, the controller being streamed (0 master, 1 slave);
+ * temperature, the 1A/9A data of the running refresh. */
+#if defined(EPD_PANEL_579)
+#define EPD_STATE_L5 uint8_t half, temperature[2];
+#else
+#define EPD_STATE_L5
+#endif
 typedef struct {
     uint8_t state, armed, shown, partial, partials, failed, failures;
+    EPD_STATE_L5
     uint16_t row, refreshes, duration;
     uint32_t at, due;
     epd_view_t old, next;
@@ -121,7 +171,8 @@ uint8_t epd_l8_set(uint16_t id, const uint8_t MCU_XDATA *in, uint8_t apply, uint
  * invalid 0x8000 shows --.-), humidity in 0.01 %RH (0xFFFF shows --, at
  * most 99) and millivolts rounded to 10 mV (0 shows -.-- V). */
 void epd_format(epd_view_t MCU_XDATA *view, int16_t centi, uint16_t humidity, uint16_t millivolts) JOIN_FAR;
-/* Renders gate row 0..EPD_ROWS-1 of view into epd.column. */
+/* Renders gate row 0..EPD_ROWS-1 of view into epd.column (L5: screen row
+ * 0..EPD_ROWS-1, top down). */
 void epd_render(const epd_view_t MCU_XDATA *view, uint16_t row) JOIN_FAR;
 /* READY only (zcl_sensor_tick): counts the clock on; while idle and due,
  * formats the values and starts a refresh when the view differs from the
