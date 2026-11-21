@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2026, cc2530-zigbee contributors. See LICENSE.
  */
-/* SSD1677 driver (display.h) of the L8 dashboard (dashboard.c). The fixed
- * LLVM link admits 45 translation units, so boards/lg_esl29.c includes this
- * file. */
+/* SSD1677 driver (display.h) of the L8 dashboard (dashboard.c), or with
+ * EPD_PANEL_579 the two-SSD1683 driver of the L5 dashboard
+ * (dashboard_l5.c). The fixed LLVM link admits 45 translation units, so
+ * boards/lg_esl29.c includes this file. */
 #include "display.h"
+#if defined(EPD_PANEL_579)
+#include "display_art_l5.h"
+#else
 #include "display_art.h"
+#endif
 #include <string.h>
 
 #if defined(__SDCC)
@@ -44,6 +49,28 @@ static const MCU_CODE uint8_t segment[10] = {
  * PANEL the BOOT BUSY wait; OLD (partial) and NEW start the previous and
  * the new plane; FULL or PARTIAL follow the new plane, SLEEP the refresh. */
 #define READY() (!(MMIO_READ(SOC_P1) & BUSY))
+#if defined(EPD_PANEL_579)
+/* PASS + 10 * (2 * new + half) starts the old/new plane of the master/slave
+ * half. */
+#define BOOT 0u
+#define PANEL 3u
+#define PASS 30u
+#define FULL 70u
+#define PARTIAL 76u
+#define SLEEP 88u
+static const MCU_CODE uint8_t commands[] = {
+    0x12, 0, 0xff,
+    0x11, 1, 0x01, 0x44, 2, 0x00, 0x31, 0x45, 4, 0x0f, 0x01, 0x00, 0x00,
+    0x91, 1, 0x00, 0xc4, 2, 0x31, 0x00, 0xc5, 4, 0x0f, 0x01, 0x00, 0x00, 0xff,
+    0x4e, 1, 0x00, 0x4f, 2, 0x0f, 0x01, 0x26, 0, 0xff,
+    0xce, 1, 0x31, 0xcf, 2, 0x0f, 0x01, 0xa6, 0, 0xff,
+    0x4e, 1, 0x00, 0x4f, 2, 0x0f, 0x01, 0x24, 0, 0xff,
+    0xce, 1, 0x31, 0xcf, 2, 0x0f, 0x01, 0xa4, 0, 0xff,
+    0x22, 1, 0xd7, 0x20, 0, 0xff,
+    0x3c, 1, 0x80, 0xbc, 1, 0x80, 0x22, 1, 0xdf, 0x20, 0, 0xff,
+    0x10, 1, 0x01, 0xff
+};
+#else
 #define BOOT 0u
 #define PANEL 3u
 #define OLD 37u
@@ -61,6 +88,7 @@ static const MCU_CODE uint8_t commands[] = {
     0x3c, 1, 0x80, 0x22, 1, 0xff, 0x20, 0, 0xff,
     0x10, 1, 0x01, 0xff
 };
+#endif
 
 #include "dashboard.c"
 
@@ -134,6 +162,13 @@ void MCU_COMMON_CODE epd_show(uint32_t now, int16_t centi, uint16_t humidity, ui
         !(epd_l8.dirty && epd.shown && now - epd_l8.written >= EPD_L8_SETTLE &&
           now - epd_l8.started >= EPD_L8_SPACING)) return;
     epd_format(&epd.next, centi, humidity, millivolts);
+#if defined(EPD_PANEL_579)
+    {
+        int16_t v = centi >= -2000 && centi <= 7000 ? (int16_t)((int32_t)centi * 16 / 100) : 320;
+        epd.temperature[0] = (uint8_t)(v >> 4);
+        epd.temperature[1] = (uint8_t)((uint16_t)v << 4);
+    }
+#endif
     if (epd.armed && epd.shown && !epd_l8.dirty && !memcmp(&epd.next, &epd.old, sizeof(epd.old))) {
         epd.due = now + EPD_CHECK;
         return;
@@ -180,8 +215,13 @@ void MCU_COMMON_CODE epd_step(uint32_t now) JOIN_FAR
         case EPD_POWER:
             sequence(PANEL);
             epd.row = 0;
+#if defined(EPD_PANEL_579)
+            epd.half = 0;
+            sequence(PASS);
+#else
             if (!epd.partial) goto plane;
             sequence(OLD);
+#endif
             enter(EPD_OLD, now);
             return;
         case EPD_REFRESH:
@@ -196,6 +236,34 @@ void MCU_COMMON_CODE epd_step(uint32_t now) JOIN_FAR
             done();
             return;
         }
+#if defined(EPD_PANEL_579)
+    case EPD_OLD:
+    case EPD_NEW:
+        /* A full refresh's previous plane is all zero. */
+        for (n = 0; n < EPD_ROWS_PER_STEP && epd.row != EPD_ROWS && !stalled; n++, epd.row++) {
+            if (epd.state == EPD_OLD && !epd.partial) {
+                for (i = 0; i < EPD_HALF; i++) send(1, 0);
+                continue;
+            }
+            epd_render(epd.state == EPD_OLD ? &epd.old : &epd.next, epd.row);
+            for (i = 0; i < EPD_HALF; i++) send(1, epd.column[(uint8_t)(epd.half * (EPD_HALF - 1u) + i)]);
+        }
+        if (stalled) { fail(); return; }
+        if (epd.row != EPD_ROWS) return;
+        epd.row = 0;
+        epd.half ^= 1u;
+        if (epd.state == EPD_NEW && !epd.half) {
+            send(0, 0x1a); send(1, epd.temperature[0]); send(1, epd.temperature[1]);
+            send(0, 0x9a); send(1, epd.temperature[0]); send(1, epd.temperature[1]);
+            sequence(epd.partial ? PARTIAL : FULL);
+            enter(EPD_REFRESH, now);
+            return;
+        }
+        if (!epd.half) epd.state = EPD_NEW;
+        sequence((uint8_t)(PASS + 10u * (2u * (epd.state == EPD_NEW) + epd.half)));
+        if (stalled) fail();
+        return;
+#else
     case EPD_OLD:
     case EPD_NEW:
         for (n = 0; n < EPD_ROWS_PER_STEP && epd.row != EPD_ROWS && !stalled; n++, epd.row++) {
@@ -214,6 +282,7 @@ void MCU_COMMON_CODE epd_step(uint32_t now) JOIN_FAR
             enter(EPD_REFRESH, now);
         }
         return;
+#endif
     default:
         return;
     }

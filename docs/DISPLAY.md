@@ -3,7 +3,9 @@
 The firmware drives a Waveshare 4.26" 800×480 black/white e-paper panel
 (SSD1677) wired to the LG ESL29 board's display FPC and shows a Home
 Assistant dashboard. Pins, the command sequence and the timing are in
-[`include/display.h`](../include/display.h).
+[`include/display.h`](../include/display.h). `make firmware PANEL=579` builds
+the same firmware for the Waveshare 5.79" 792×272 panel instead
+([L5](#l5-the-579-panel)).
 
 ## Driver and schedule
 
@@ -67,6 +69,46 @@ it from the pinned `@mdi/svg` SVGs (needs cairosvg and Pillow):
 ```sh
 python3 tools/epd/l8_icons.py [--svg DIR]
 ```
+
+## L5: the 5.79" panel
+
+With `EPD_PANEL_579` (`make firmware PANEL=579`: `tools/stage_panel.py`
+stages the tracked tree in `build/app-579` with a manifest that adds the
+define and leaves out `CC2530_APP_MGMT_LQI`) the firmware drives the
+Waveshare 5.79" 792×272 panel: two cascaded SSD1683, the master for the left
+half and the slave (commands `| 0x80`) for the right one, with the same pins.
+
+- Every refresh streams four passes of 272 rows × 50 octets: the previous
+  plane (`26`, `A6`; all zero for a full refresh) and the new one (`24`, `A4`),
+  master then slave; the halves share octet 49 of the 99-octet row.
+- A load-temperature update hangs the slave, so the driver writes the SHT3x
+  temperature (`1A`, `9A`; 20 °C when unknown) and refreshes with `22 D7`
+  (full, about 3.4 s) or `3C 80`, `BC 80`, `22 DF` (partial, about 0.45 s).
+  Partial refreshes leave light ghosts that the full one every 13th time
+  clears.
+- [`src/dashboard_l5.c`](../src/dashboard_l5.c) renders the L5 layout row by
+  row and runs in bank 6 with its tables: a black header (battery, voltage,
+  clock, signal bars and `-63 dBm` in white), `ДОМА` and `УЛИЦА` with
+  7-segment temperatures and humidities (the D3 digits: tapered bars,
+  pointed verticals, the `1` in the middle of its cell), a 48×48 weather
+  icon, four slots and the message. Text is proportional DejaVu Sans,
+  22 px (header, units, message) and 13 px bold (labels), rasterised once
+  without anti-aliasing. The store, the cluster and the views are those of
+  L8; the header shows no LQI.
+
+[`tools/epd/l5_art.py`](../tools/epd/l5_art.py) is the L5 reference and writes
+[`include/display_art_l5.h`](../include/display_art_l5.h) and
+[`tests/display_golden_l5.h`](../tests/display_golden_l5.h);
+`tests/test_display_579.c` checks the renderer and the two-controller
+sequence:
+
+```sh
+make art FONTS=<u8g2>/tools/font/bdf DEJAVU=/usr/share/fonts/truetype/dejavu
+python3 tools/epd/l5_art.py --dejavu DIR [--check] [--png out.png]
+```
+
+The generated header records the SHA-256 of the font files it was made from
+(DejaVu 2.37).
 
 ## Cluster 0xFC10
 
@@ -156,9 +198,57 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
+The L5 text uses DejaVu Sans and DejaVu Sans Bold, rasterised to bitmaps:
+
+```
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved. Bitstream Vera
+is a trademark of Bitstream, Inc. DejaVu changes are in public domain.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of the fonts accompanying this license ("Fonts") and associated
+documentation files (the "Font Software"), to reproduce and distribute the
+Font Software, including without limitation the rights to use, copy, merge,
+publish, distribute, and/or sell copies of the Font Software, and to permit
+persons to whom the Font Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright and trademark notices and this permission notice shall
+be included in all copies of one or more of the Font Software typefaces.
+
+The Font Software may be modified, altered, or added to, and in particular
+the designs of glyphs or characters in the Fonts may be modified and
+additional glyphs or characters may be added to the Fonts, only if the fonts
+are renamed to names not containing either the words "Bitstream" or the word
+"Vera".
+
+This License becomes null and void to the extent applicable to Fonts or Font
+Software that has been modified and is distributed under the "Bitstream
+Vera" names.
+
+The Font Software may be sold as part of a larger software package but no
+copy of one or more of the Font Software typefaces may be sold by itself.
+
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT,
+TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL BITSTREAM OR THE GNOME
+FOUNDATION BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING
+ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE
+FONT SOFTWARE.
+
+Except as contained in this notice, the names of Gnome, the Gnome
+Foundation, and Bitstream Inc., shall not be used in advertising or
+otherwise to promote the sale, use or other dealings in this Font Software
+without prior written authorization from the Gnome Foundation or Bitstream
+Inc., respectively. For further information, contact: fonts at gnome dot
+org.
+```
+
 ## Icon notice
 
-The L8 weather icons are rasterised from Material Design Icons
+The L8 and L5 weather icons are rasterised from Material Design Icons
 (`@mdi/svg` 7.4.47) by [Pictogrammers](https://pictogrammers.com/),
 licensed under the Apache License, Version 2.0
 (<https://www.apache.org/licenses/LICENSE-2.0>). They are converted to

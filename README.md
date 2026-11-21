@@ -2,7 +2,8 @@
 
 Open firmware that turns an LG ESL29 electronic shelf label board (CC2530)
 with a Waveshare 4.26" 800×480 e-paper panel (SSD1677) into a Home Assistant
-dashboard. It is a LEAN, PM2 sleepy Zigbee 3.0 end device built on the
+dashboard (or, built with `PANEL=579`, a Waveshare 5.79" 792×272 panel with
+two SSD1683). It is a LEAN, PM2 sleepy Zigbee 3.0 end device built on the
 [cc2530-zigbee](https://github.com/faronov/cc2530-zigbee) stack with the
 LLVM MCS-51 compiler, and it does not use Z-Stack.
 
@@ -22,6 +23,9 @@ ZHA quirk and the Zigbee2MQTT converter in [`tools/ha/`](tools/ha) apply.
   redraws the dashboard on writes from Home Assistant.
 - Partial refresh with a full refresh every 13th time, at boot and after a
   failure; not yet verified on hardware.
+- 5.79" (`PANEL=579`): the command sequence and the layout were shown on the
+  panel from the debugger; the firmware itself is not yet verified on
+  hardware.
 - Not yet qualified: sleep current.
 
 ## SHT3x sensor
@@ -43,11 +47,13 @@ invalid and the panel shows `--`. The CC2530 die temperature is not used.
 | `include/app_config.h` | board identity |
 | `include/app_zcl.h`, `src/zcl_dashboard.c` | ZCL application server, simple descriptor |
 | `include/sht3x.h`, `src/sht3x.c` | SHT3x temperature and humidity on bit-banged I2C |
-| `include/display.h`, `src/display.c` | SSD1677 driver and refresh state machine |
+| `include/display.h`, `src/display.c` | SSD1677 (and 5.79" two-SSD1683) driver and refresh state machine |
 | `src/dashboard.c`, `include/display_art.h` | dashboard renderer, cluster 0xFC10, generated glyphs and icons |
+| `src/dashboard_l5.c`, `include/display_art_l5.h` | 5.79" L5 renderer and its generated fonts and icons |
 | `boards/lg_esl29.c` | early pin parking, panel power |
-| `tests/` | host tests: renderer against goldens, ZCL server |
-| `tools/epd/` | glyph, icon and golden generator |
+| `tests/` | host tests: renderers against goldens, ZCL server |
+| `tools/epd/` | glyph, icon and golden generators (L8, L5) |
+| `tools/stage_panel.py` | stages the 5.79" application for `make firmware PANEL=579` |
 | `tools/ha/` | ZHA quirk, Home Assistant package, Zigbee2MQTT converter |
 
 ## Build
@@ -69,7 +75,8 @@ the prebuilt `mcs51-llvm-<version>-<revision>` toolchain from the
 (runtime, startup, linker script) is used, so a sparse checkout is enough.
 CI uses the release and builds LLVM only when the pinned revision has none.
 The image, its audit and its sealed receipt are written to `build/firmware/`
-(`firmware.hex`).
+(`firmware.hex`); `make firmware PANEL=579 ...` writes the 5.79" image to
+`build/firmware-579/`.
 
 CI builds the compiler and the firmware on every push and uploads the HEX as an
 artifact.
