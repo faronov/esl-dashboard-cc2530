@@ -34,8 +34,10 @@
 #define LQI_FIRST 15u
 #define LQI_ENTRY 22u
 
-#if !defined(CC2530_APP_MGMT_LQI)
-#error The dashboard reads the parent LQI: define CC2530_APP_MGMT_LQI
+/* The L8 header shows the parent's LQI; the L5 one does not, so its build
+ * leaves CC2530_APP_MGMT_LQI out. */
+#if !defined(CC2530_APP_MGMT_LQI) && !defined(EPD_PANEL_579)
+#error The L8 dashboard reads the parent LQI: define CC2530_APP_MGMT_LQI
 #endif
 
 /* The single simple descriptor (zdo_srv.h): endpoint 1, Home Automation,
@@ -47,6 +49,7 @@ static const MCU_CODE uint8_t descriptor[] = {
 };
 MCU_XDATA uint8_t zdo_srv_descriptors[sizeof(descriptor)];
 
+#if defined(CC2530_APP_MGMT_LQI)
 /* The parent's LQI of this device (epd_l8.linked/lqi), polled like
  * e-monitor: Mgmt_Lqi_req to the parent, own entry by short address, the
  * next page while it is not found, then the found page first. waiting: the
@@ -57,6 +60,7 @@ static MCU_XDATA struct {
     uint16_t parent, age;
     uint8_t tsn, start, waiting;
 } lqi;
+#endif
 
 typedef char zcl_sensor_overlay[sizeof(zcl_sensor_state_t) <= sizeof(join_smoke_device.record) ? 1 : -1];
 
@@ -480,6 +484,7 @@ static uint8_t management_bind(void)
     return ZCL_SENSOR_HANDLED;
 }
 
+#if defined(CC2530_APP_MGMT_LQI)
 /* Due once the response slot, its TX and the runtime query are idle. */
 static __attribute__((noinline)) void lqi_request(void)
 {
@@ -525,6 +530,7 @@ static __attribute__((noinline)) uint8_t lqi_response(void)
     }
     return ZCL_SENSOR_HANDLED;
 }
+#endif
 
 /* Bound, enabled, past min and past max or the reportable change (0: any
  * change); leaves the value in ST.value. */
@@ -584,8 +590,10 @@ uint8_t zcl_sensor_init(const security_keys_config_t MCU_XDATA *identity) JOIN_F
     }
     ST.bound[0] = ST.bound[1] = ST.bound[2] = 1;
     ST.second = CTX.last;
+#if defined(CC2530_APP_MGMT_LQI)
     lqi.age = LQI_PERIOD-LQI_FIRST;
     lqi.start = lqi.waiting = 0;
+#endif
     ST.basic = 1;
     return 1;
 }
@@ -605,7 +613,9 @@ void zcl_sensor_tick(void) JOIN_FAR
         for (r = ST.report; r != ST.report+ZCL_SENSOR_REPORTS; r++)
             if (r->age != 0xffffu) r->age++;
         if (ST.identify) ST.identify--;
+#if defined(CC2530_APP_MGMT_LQI)
         if (lqi.age < LQI_PERIOD) lqi.age++;
+#endif
         if (ST.measured != 0xffu) ST.measured++;
     }
     if (ST.measured >= ZCL_SENSOR_MEASURE) measure(0);
@@ -618,13 +628,17 @@ uint8_t zcl_sensor_serve(void) JOIN_FAR
         if (RX.nwk.destination >= 0xfffbu || RX.aps.delivery_mode) return ZCL_SENSOR_DISCARDED;
         if (!RX.aps.profile_id && !RX.aps.destination_endpoint) {
             if (RX.aps.cluster_id == ZDO_SRV_MGMT_BIND_REQUEST) return management_bind();
+#if defined(CC2530_APP_MGMT_LQI)
             if (RX.aps.cluster_id == (ZDO_SRV_MGMT_LQI_REQUEST | 0x8000u)) return lqi_response();
+#endif
             return RX.aps.cluster_id == ZDO_SRV_BIND_REQUEST || RX.aps.cluster_id == ZDO_SRV_UNBIND_REQUEST ?
                 bind() : ZCL_SENSOR_DISCARDED;
         }
         return zcl();
     }
+#if defined(CC2530_APP_MGMT_LQI)
     lqi_request();
+#endif
     if (DEV.application_pending || DEV.application_done) return ZCL_SENSOR_IDLE;
     return report();
 }
