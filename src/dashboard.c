@@ -395,12 +395,20 @@ void epd_format(epd_view_t MCU_XDATA *view, int16_t centi, uint16_t humidity, ui
 }
 
 /* --- cluster 0xFC10 --- */
-static uint8_t MCU_XDATA *l8_field(uint16_t id, uint8_t *capacity)
+/* No pointers to locals here: the pinned MCS-51 compiler may keep such a
+ * local on the IRAM stack but pass an XDATA address to it (the callee's
+ * writes then miss it and land in page 0 of XDATA). */
+static uint8_t MCU_XDATA *l8_field(uint16_t id)
 {
     uint8_t k = (uint8_t)(id - 0x20u);
-    if (id == 0x30u) { *capacity = EPD_L8_MESSAGE; return epd_l8.message; }
-    *capacity = k & 1u ? EPD_L8_VALUE : EPD_L8_LABEL;
+    if (id == 0x30u) return epd_l8.message;
     return k & 1u ? epd_l8.value[k >> 1] : epd_l8.label[k >> 1];
+}
+
+static uint8_t l8_capacity(uint16_t id)
+{
+    if (id == 0x30u) return EPD_L8_MESSAGE;
+    return (uint8_t)(id - 0x20u) & 1u ? EPD_L8_VALUE : EPD_L8_LABEL;
 }
 
 uint8_t epd_l8_type(uint16_t id) JOIN_FAR
@@ -429,7 +437,8 @@ uint8_t epd_l8_get(uint16_t id, uint8_t MCU_XDATA *out, uint8_t apply) JOIN_FAR
     uint32_t t;
     l8_prepare();
     if (epd_l8_type(id) == 0x42u) {
-        text = l8_field(id, &capacity);
+        text = l8_field(id);
+        capacity = l8_capacity(id);
         for (i = 0; i < capacity && text[i] != EPD_L8_END; i++) {
             v = l8_point(text[i]);
             if (v < 0x80u) {
@@ -460,19 +469,23 @@ uint8_t epd_l8_get(uint16_t id, uint8_t MCU_XDATA *out, uint8_t apply) JOIN_FAR
     return 2;
 }
 
-/* Glyph code of the UTF-8 sequence at in[*at] (< n), advancing *at; 0xFF
- * for a stray continuation octet. */
-static uint8_t l8_decode(const uint8_t MCU_XDATA *in, uint8_t *at, uint8_t n)
+/* The read position of l8_decode (a static, see l8_field). */
+static MCU_XDATA uint8_t l8_at;
+
+/* Glyph code of the UTF-8 sequence at in[l8_at] (< n), advancing l8_at;
+ * 0xFF for a stray continuation octet. */
+
+static uint8_t l8_decode(const uint8_t MCU_XDATA *in, uint8_t n)
 {
-    uint8_t b = in[(*at)++], extra;
+    uint8_t b = in[l8_at++], extra;
     uint16_t cp;
     if (b < 0x80u) return b >= 0x20u && b < 0x7fu ? G(b) : EPD_L8_QMARK;
     if (b < 0xc0u) return EPD_L8_END;
     extra = b < 0xe0u ? 1u : b < 0xf0u ? 2u : 3u;
     cp = b & 0x1fu;
     for (b = extra; b; b--) {
-        if (*at >= n || (in[*at] & 0xc0u) != 0x80u) return EPD_L8_QMARK;
-        cp = (uint16_t)(cp << 6 | (in[(*at)++] & 0x3fu));
+        if (l8_at >= n || (in[l8_at] & 0xc0u) != 0x80u) return EPD_L8_QMARK;
+        cp = (uint16_t)(cp << 6 | (in[l8_at++] & 0x3fu));
     }
     if (extra != 1u) return EPD_L8_QMARK;
     if (cp >= 0x410u && cp < 0x450u) return (uint8_t)(cp - 0x410u + CYRILLIC);
@@ -482,7 +495,7 @@ static uint8_t l8_decode(const uint8_t MCU_XDATA *in, uint8_t *at, uint8_t n)
 uint8_t epd_l8_set(uint16_t id, const uint8_t MCU_XDATA *in, uint8_t apply, uint32_t now) JOIN_FAR
 {
     uint8_t MCU_XDATA *text;
-    uint8_t capacity, n, at, i, c, changed = 0;
+    uint8_t capacity, n, i, c, changed = 0;
     uint16_t v = (uint16_t)(in[0] | (uint16_t)in[1] << 8);
     uint32_t t;
     l8_prepare();
@@ -492,12 +505,13 @@ uint8_t epd_l8_set(uint16_t id, const uint8_t MCU_XDATA *in, uint8_t apply, uint
     if (!apply) return 0;
     epd_l8.written = now;
     if (epd_l8_type(id) == 0x42u) {
-        text = l8_field(id, &capacity);
+        text = l8_field(id);
+        capacity = l8_capacity(id);
         n = in[0] == 0xffu ? 0 : in[0];
         in++;
-        for (i = 0, at = 0; i < capacity; i++) {
+        for (i = 0, l8_at = 0; i < capacity; i++) {
             c = EPD_L8_END;
-            while (at < n && (c = l8_decode(in, &at, n)) == EPD_L8_END) {}
+            while (l8_at < n && (c = l8_decode(in, n)) == EPD_L8_END) {}
             if (text[i] != c) { text[i] = c; changed = 1; }
         }
     } else if (!id) {
