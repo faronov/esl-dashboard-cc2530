@@ -57,15 +57,17 @@ static void MCU_COMMON_CODE l8_prepare(void)
     epd_l8.ready = 1;
 }
 
-/* Counts the clock on by the whole seconds since tick. */
+/* Counts the clock on by the whole seconds since tick. It runs on every
+ * READY poll, so it subtracts instead of calling the 32-bit software
+ * division (most of the awake time on H2 went there); a poll is normally at
+ * most one second past the last. */
 static void l8_tick(uint32_t now)
 {
-    uint32_t d;
     l8_prepare();
-    d = (now - epd_l8.tick) / 62500UL;
-    if (!d) return;
-    epd_l8.tick += d * 62500UL;
-    if (epd_l8.time) epd_l8.time += d;
+    while (now - epd_l8.tick >= 62500UL) {
+        epd_l8.tick += 62500UL;
+        if (epd_l8.time) epd_l8.time++;
+    }
 }
 
 #if defined(EPD_PANEL_579)
