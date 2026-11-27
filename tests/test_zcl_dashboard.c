@@ -207,13 +207,15 @@ static uint8_t sensor_poll(void)
     return zcl_sensor_serve();
 }
 
+static uint8_t receive_endpoint = 1;
+
 static uint8_t receive(uint16_t cluster, const void *payload, uint8_t length)
 {
     uint8_t result;
     memset(&CTX.application, 0, sizeof(CTX.application));
     CTX.application.nwk.source = 0x0000; CTX.application.nwk.destination = 0x4321;
     CTX.application.aps.profile_id = 0x0104; CTX.application.aps.cluster_id = cluster;
-    CTX.application.aps.source_endpoint = 9; CTX.application.aps.destination_endpoint = 1;
+    CTX.application.aps.source_endpoint = 9; CTX.application.aps.destination_endpoint = receive_endpoint;
     memcpy(CTX.application.payload, payload, length); CTX.application.length = length;
     CTX.application_ready = 1;
     result = sensor_poll();
@@ -587,9 +589,25 @@ static void configure(void)
     CHECK(!ST.report[0].min && !ST.report[0].max && ST.report[0].change == 7);
     /* A non-integer reportable type has no parsed change field. */
     zcl(0x0001, "\x00\x67\x06\x00\x20\x00\x30\x01\x00\x02\x00", 11, "\x18\x67\x07\x8d\x00\x20\x00", 7);
-    /* Restore defaults and disable. */
+    /* An analog float's four-byte change is consumed before INVALID_DATA_TYPE;
+     * the next record still applies. */
+    zcl(0x0402, "\x00\x6a\x06\x00\x00\x00\x39\x01\x00\x02\x00\x00\x00\x80\x3f"
+        "\x00\x00\x00\x29\x03\x00\x04\x00\x05\x00", 25, "\x18\x6a\x07\x8d\x00\x00\x00", 7);
+    CHECK(ST.report[0].min == 3 && ST.report[0].max == 4 && ST.report[0].change == 5);
+    /* A negative int16 threshold is kept as sent; its non-value 8000 is invalid. */
+    zcl(0x0402, "\x00\x6b\x06\x00\x00\x00\x29\x00\x00\x00\x00\xf6\xff", 13, "\x18\x6b\x07\x00", 4);
+    CHECK(ST.report[0].change == 0xfff6u);
+    zcl(0x0402, "\x00\x6c\x06\x00\x00\x00\x29\x00\x00\x00\x00\x00\x80", 13,
+        "\x18\x6c\x07\x87\x00\x00\x00", 7);
+    /* Restore defaults and disable; the change baseline is the current value. */
+    ST.report[0].last = 0x1234;
     zcl(0x0402, "\x10\x68\x06\x00\x00\x00\x29\xff\xff\x00\x00\x00\x00", 13, "\x18\x68\x07\x00", 4);
     CHECK(ST.report[0].min == 30 && ST.report[0].max == 300 && ST.report[0].change == 10);
+    CHECK(ST.report[0].last != 0x1234);
+    /* The APS broadcast endpoint FF reaches endpoint 1, which answers. */
+    receive_endpoint = 0xff;
+    zcl(0x0003, "\x00\x74\x00\x00\x00", 5, "\x18\x74\x01\x00\x00\x00\x21\x00\x00", 9);
+    receive_endpoint = 1;
     zcl(0x0405, "\x00\x69\x06\x00\x00\x00\x21\x00\x00\xff\xff\x00\x00", 13, "\x18\x69\x07\x00", 4);
     CHECK(ST.report[1].max == 0xffff);
 }
@@ -619,7 +637,10 @@ static void bind(void)
     CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\x70\x8c", 2);
     request[10] = 0x01; request[9] = 2;
     CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\x70\x82", 2);
-    request[9] = 1; request[21] = 0xff;
+    /* F1-FE are reserved, not application endpoints. */
+    request[9] = 1; request[21] = 0xf1;
+    CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\x70\x82", 2);
+    request[21] = 0xff;
     CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\x70\x82", 2);
     request[21] = 1; request[1] ^= 1;
     CHECK(zdo(0x0021, request, 22) == ZCL_SENSOR_HANDLED); reply(0x8021, "\x70\x84", 2);
@@ -635,19 +656,36 @@ static void bind(void)
 
 /* Synthetic sawtooth schedule; chip() covers measured reports. */
 
-/* Mgmt_Bind_req is NOT_SUPPORTED; a short request or a busy slot drops it.
- * Init rejects an unknown identity without touching the state. */
+/* Mgmt_Bind_req returns the live source binding table (R22 2.4.4.4.4):
+ * after init all three clusters are bound to TC endpoint 1; the start index
+ * pages it. A short request or a busy slot drops it. Init rejects an unknown
+ * identity without touching the state. */
+static uint8_t binding_golden(uint8_t *output, uint8_t sequence, uint8_t start)
+{
+    static const uint16_t clusters[3] = {0x0402, 0x0405, 0x0001};
+    uint8_t at = 5, i;
+    output[0] = sequence; output[1] = 0; output[2] = 3; output[3] = start; output[4] = 0;
+    for (i = start; i < 3u; i++) {
+        memcpy(output+at, own, 8); output[at+8] = 1;
+        output[at+9] = (uint8_t)clusters[i]; output[at+10] = (uint8_t)(clusters[i] >> 8);
+        output[at+11] = 3; memcpy(output+at+12, tc, 8); output[at+20] = 1;
+        at += 21; output[4]++;
+    }
+    return at;
+}
+
 static void management_bind(void)
 {
     zcl_sensor_state_t before;
     ed_packet_t occupied;
     security_keys_config_t identity;
+    uint8_t expected[ED_PAYLOAD_MAX], length;
     reset(0);
     before = ST;
     CHECK(zdo(0x0033, "\x91\x00", 2) == ZCL_SENSOR_HANDLED);
-    reply(0x8033, "\x91\x84", 2);
-    CHECK(zdo(0x0033, "\x92\x05\x77", 3) == ZCL_SENSOR_HANDLED);
-    reply(0x8033, "\x92\x84", 2);
+    length = binding_golden(expected, 0x91, 0); reply(0x8033, expected, length);
+    CHECK(zdo(0x0033, "\x92\x02", 2) == ZCL_SENSOR_HANDLED);
+    length = binding_golden(expected, 0x92, 2); reply(0x8033, expected, length);
     CHECK(!memcmp(ST.bound, before.bound, sizeof(ST.bound)) && !memcmp(ST.report, before.report, sizeof(ST.report)));
     CHECK(ST.basic == before.basic && ST.pending == before.pending && ST.sent == before.sent && ST.tsn == before.tsn);
     CHECK(zdo(0x0033, "\x93", 1) == ZCL_SENSOR_DISCARDED && !CTX.response_pending);

@@ -148,6 +148,16 @@ static uint16_t value(uint8_t entry)
 
 /* Octets of the parsed fixed-size types: data, boolean, bitmap, integer and
  * enumeration (08..31). Other types, including strings, are 0. */
+/* Analog types carry a ReportableChange in Configure Reporting (R8 Table
+ * 2-11): integers 20-2F, floats 38-3A, times E0-E2; others have none. */
+static uint8_t change_width(uint8_t type)
+{
+    if ((uint8_t)(type-0x20u) < 0x10u) return (uint8_t)((type & 7u)+1u);
+    if ((uint8_t)(type-0x38u) < 3u) return (uint8_t)(2u << (type-0x38u));
+    if ((uint8_t)(type-0xe0u) < 3u) return 4;
+    return 0;
+}
+
 static uint8_t width(uint8_t type)
 {
     if (type < 0x08u) return 0;
@@ -319,11 +329,13 @@ static uint8_t configure(void)
             if (!ST.dir) {
                 if (left() < 5u) return 0x80;
                 ST.kind = take(); ST.min = take16(); ST.max = take16();
-                /* Integers (20..2F) are the parsed analog types. */
-                n = (uint8_t)(ST.kind-0x20u) < 0x10u ? width(ST.kind) : 0;
+                n = change_width(ST.kind);
+                if (left() < n) return 0x80;
                 if (ST.entry < ZCL_SENSOR_REPORTS) {
                     if (ST.kind != ST.type) ST.status = 0x8d;
                     else if (ST.max && ST.max != 0xffffu && ST.max < ST.min) ST.status = 0x87;
+                    /* The int16 non-value is no threshold. */
+                    else if (ST.kind == 0x29u && LE(ST.in) == 0x8000u) ST.status = 0x87;
                     else ST.status = 0;
                 }
             }
@@ -331,12 +343,15 @@ static uint8_t configure(void)
             if (ST.apply) {
                 if (ST.status) {
                     emit(ST.status); emit(ST.dir); emit16(ST.id);
-                } else if (!ST.max && ST.min == 0xffffu) {
-                    restore(ST.entry);
                 } else {
                     r = reporting(ST.entry);
-                    r->min = ST.min; r->max = ST.max;
-                    r->change = n > 1u ? LE(ST.in) : IN[ST.in];
+                    if (!ST.max && ST.min == 0xffffu) restore(ST.entry);
+                    else {
+                        r->min = ST.min; r->max = ST.max;
+                        r->change = n > 1u ? LE(ST.in) : IN[ST.in];
+                    }
+                    /* Changes count from the configuration-time value (R8 2.5.11.2.3). */
+                    r->last = value(ST.entry);
                 }
             }
             ST.in += n;
@@ -393,8 +408,11 @@ static uint8_t specific(uint8_t command)
 static uint8_t zcl(void)
 {
     uint8_t control, command;
+    /* The transport admits (and ACKs) the APS broadcast endpoint FF for the
+     * one local endpoint, which answers from its own endpoint. */
     if (RX.aps.profile_id != DEV.config.transport.profile ||
-        RX.aps.destination_endpoint != DEV.config.transport.endpoint) return ZCL_SENSOR_DISCARDED;
+        (RX.aps.destination_endpoint != DEV.config.transport.endpoint &&
+         RX.aps.destination_endpoint != 0xffu)) return ZCL_SENSOR_DISCARDED;
     ST.length = RX.length;
     if (!ST.length || ST.length > ED_PAYLOAD_MAX) return ZCL_SENSOR_DISCARDED;
     control = IN[0];
@@ -447,7 +465,8 @@ static uint8_t bind(void)
     ST.status = 0x84;
     if (!memcmp(IN+1, DEV.config.association.extraction.local, 8) && mode == 3u) {
         ST.status = 0x82;
-        if (IN[9] == DEV.config.transport.endpoint && IN[21] && IN[21] != 0xffu) {
+        /* Application destination endpoints are 01-F0; F1-FE are reserved. */
+        if (IN[9] == DEV.config.transport.endpoint && (uint8_t)(IN[21]-1u) < 0xf0u) {
             ST.dir = RX.aps.cluster_id == ZDO_SRV_BIND_REQUEST;
             ST.status = ST.dir ? 0x8cu : 0x88u;
             if (ST.entry != NONE && !memcmp(IN+13, ST.tc_ieee, 8) &&
@@ -473,13 +492,47 @@ static uint8_t known_ieee(const uint8_t MCU_XDATA *ieee)
     return any && different;
 }
 
-/* Mgmt_Bind_req is optional for an end device: NOT_SUPPORTED (sequence
- * and status only). */
+/* R22 2.4.4.4.4: a device that owns source bindings answers Mgmt_Bind_req
+ * with its live binding table (extended-address entries, start index). */
+static uint8_t binding_page(uint8_t sequence, uint8_t start, uint8_t MCU_XDATA *output, uint8_t capacity)
+{
+    uint8_t i, total = 0, index = 0, at = 5;
+    uint16_t cluster;
+    if (!known_ieee(DEV.config.association.extraction.local) || !known_ieee(ST.tc_ieee) ||
+        !DEV.config.transport.endpoint || DEV.config.transport.endpoint > 0xf0u)
+        return 0;
+    for (i = 0; i < 3u; i++) {
+        if (ST.bound[i] == 0xffu) return 0;
+        if (ST.bound[i]) total++;
+    }
+    output[0] = sequence; output[1] = 0; output[2] = total;
+    output[3] = total ? start : 0; output[4] = 0;
+    for (i = 0; i < 3u; i++) {
+        if (!ST.bound[i]) continue;
+        if (index++ < start) continue;
+        if ((uint8_t)(capacity-at) < 21u) break;
+        memcpy(output+at, DEV.config.association.extraction.local, 8);
+        output[at+8u] = DEV.config.transport.endpoint;
+        cluster = attributes[i].cluster;
+        output[at+9u] = (uint8_t)cluster; output[at+10u] = (uint8_t)(cluster >> 8);
+        output[at+11u] = 3;
+        memcpy(output+at+12u, ST.tc_ieee, 8);
+        output[at+20u] = ST.bound[i];
+        at += 21; output[4]++;
+    }
+    return at;
+}
+
 static uint8_t management_bind(void)
 {
-    if (RX.length < 2u || !reply(ZDO_SRV_MGMT_BIND_REQUEST | 0x8000u)) return ZCL_SENSOR_DISCARDED;
-    OUT[0] = IN[0]; OUT[1] = 0x84;
-    CTX.response.length = 2;
+    if (RX.nwk.type || RX.aps.type || RX.aps.source_endpoint ||
+        (RX.aps.flags & (uint8_t)~APS_FLAG_ACK_REQUEST) ||
+        RX.length < 2u || RX.length > ED_PAYLOAD_MAX)
+        return ZCL_SENSOR_DISCARDED;
+    if (!reply(ZDO_SRV_MGMT_BIND_REQUEST | 0x8000u)) return ZCL_SENSOR_DISCARDED;
+    CTX.response.length = binding_page(IN[0], IN[1], OUT, ED_PAYLOAD_MAX);
+    if (!CTX.response.length) return ZCL_SENSOR_DISCARDED;
+    CTX.response.aps.destination_endpoint = RX.aps.source_endpoint;
     CTX.response_pending = 1;
     return ZCL_SENSOR_HANDLED;
 }
@@ -537,12 +590,16 @@ static __attribute__((noinline)) uint8_t lqi_response(void)
 static uint8_t due(uint8_t entry)
 {
     zcl_sensor_reporting_t MCU_XDATA *r = reporting(entry);
+    uint16_t change;
     ST.value = value(entry);
     if (r->max == 0xffffu || r->age < r->min) return 0;
     if (r->max && r->age >= r->max) return 1;
     ST.delta = ST.value-r->last;
     if ((int16_t)ST.delta < 0) ST.delta = (uint16_t)-ST.delta;
-    if (!ST.delta || ST.delta < r->change) return 0;
+    /* A signed (int16) threshold counts by magnitude. */
+    change = r->change;
+    if (attributes[entry].type == 0x29u && (int16_t)change < 0) change = (uint16_t)-change;
+    if (!ST.delta || ST.delta < change) return 0;
     return 1;
 }
 
